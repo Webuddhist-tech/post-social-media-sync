@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Post Sync</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b5bd6'/%3E%3Cpath d='M9 16h14M17 10l6 6-6 6' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="login" class="login" hidden>
+      <form id="login-form" class="card login-card">
+        <div class="brand brand-lg"><span class="logo"></span>Post Sync</div>
+        <p class="muted">Write once, publish everywhere.</p>
+        <label class="field">
+          <span>Password</span>
+          <input type="password" name="password" autocomplete="current-password" required autofocus />
+        </label>
+        <p id="login-error" class="error-text" hidden></p>
+        <button class="btn btn-primary btn-block" type="submit">Log in</button>
+      </form>
+    </div>
+
+    <div id="app" hidden>
+      <header class="topbar">
+        <div class="brand"><span class="logo"></span>Post Sync</div>
+        <nav class="tabs" id="tabs">
+          <a href="#compose" data-view="compose">Compose</a>
+          <a href="#history" data-view="history">Posts</a>
+          <a href="#accounts" data-view="accounts">Accounts</a>
+          <a href="#setup" data-view="setup">Setup</a>
+        </nav>
+        <button class="btn btn-ghost" id="logout" type="button">Log out</button>
+      </header>
+
+      <main>
+        <!-- Compose -->
+        <section id="view-compose" class="view" hidden>
+          <div class="compose-grid">
+            <div class="col">
+              <div class="card">
+                <h2>New post</h2>
+                <label class="field" id="title-field" hidden>
+                  <span>Title <small class="muted" id="title-hint"></small></span>
+                  <input id="title" type="text" maxlength="100" placeholder="Video title (YouTube, Facebook, LinkedIn)" />
+                </label>
+                <label class="field">
+                  <span>Caption</span>
+                  <textarea id="text" rows="8" placeholder="What do you want to share? #hashtags and links work everywhere."></textarea>
+                </label>
+                <div id="counters" class="counters"></div>
+
+                <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Add photos or videos">
+                  <input id="file-input" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm,video/x-m4v" hidden />
+                  <div class="dropzone-inner">
+                    <strong>Add photos or a video</strong>
+                    <span class="muted">Drag files here or click to browse</span>
+                  </div>
+                </div>
+                <div id="media-list" class="media-list"></div>
+              </div>
+
+              <div class="card" id="overrides-card" hidden>
+                <details id="overrides">
+                  <summary>Different caption per platform <span class="muted">(optional)</span></summary>
+                  <div id="override-fields"></div>
+                </details>
+              </div>
+            </div>
+
+            <div class="col">
+              <div class="card">
+                <div class="card-head">
+                  <h2>Post to</h2>
+                  <button class="btn btn-ghost btn-sm" id="select-all" type="button">Select all</button>
+                </div>
+                <div id="account-picker" class="account-picker"></div>
+              </div>
+
+              <div class="card" id="options-card" hidden>
+                <h2>Platform settings</h2>
+                <div id="platform-options"></div>
+              </div>
+
+              <div class="card">
+                <h2>When</h2>
+                <div class="segmented" role="radiogroup">
+                  <label><input type="radio" name="when" value="now" checked /> <span>Publish now</span></label>
+                  <label><input type="radio" name="when" value="later" /> <span>Schedule</span></label>
+                </div>
+                <input id="scheduled-at" type="datetime-local" class="mt" hidden />
+                <div id="issues" class="issues" hidden></div>
+                <button class="btn btn-primary btn-block btn-lg mt" id="publish" type="button" disabled>Publish</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- History -->
+        <section id="view-history" class="view" hidden>
+          <div class="view-head">
+            <h1>Posts</h1>
+          </div>
+          <div id="post-list" class="post-list"></div>
+          <button class="btn btn-ghost btn-block" id="load-more" type="button" hidden>Load older posts</button>
+        </section>
+
+        <!-- Accounts -->
+        <section id="view-accounts" class="view" hidden>
+          <div class="view-head"><h1>Accounts</h1></div>
+          <div class="card">
+            <h2>Connected</h2>
+            <div id="account-list" class="account-list"></div>
+          </div>
+          <div class="card">
+            <h2>Connect a platform</h2>
+            <div id="connect-list" class="connect-list"></div>
+          </div>
+        </section>
+
+        <!-- Setup -->
+        <section id="view-setup" class="view" hidden>
+          <div class="view-head"><h1>Setup</h1></div>
+          <div class="card" id="server-status"></div>
+          <div id="setup-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
