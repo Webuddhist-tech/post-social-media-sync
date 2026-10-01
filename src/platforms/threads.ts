@@ -1,6 +1,8 @@
-import { UserError } from "../http.js";
+import { isUnknownOutcome, uncertainOutcome, UserError } from "../http.js";
 import type { MediaFile } from "../media.js";
-import { graph, pollUntil } from "./meta.js";
+import { pollUntil } from "./common.js";
+import { graph } from "./meta.js";
+import { URL_RE } from "../text.js";
 import type { Connector, Platform, PublishContext } from "./types.js";
 
 const API = "https://graph.threads.net/v1.0";
@@ -78,14 +80,24 @@ async function waitForContainer(ctx: PublishContext, id: string, token: string):
       }
       return null;
     },
-    { intervalMs: 3000, timeoutMs: 15 * 60_000, what: "Threads to process the media" },
+    { intervalMs: 5000, maxIntervalMs: 60_000, timeoutMs: 15 * 60_000, what: "Threads to process the media" },
   );
 }
 
+const MAX_IMAGE_BYTES = 8_000_000;
+
 async function mediaFields(ctx: PublishContext, m: MediaFile): Promise<Record<string, string>> {
   if (m.kind === "video") return { media_type: "VIDEO", video_url: ctx.media.publicUrl(m.file) };
-  const image = m.mime === "image/png" ? m : await ctx.media.jpegVariant(m, { maxBytes: 8 * 1024 * 1024 });
+  // Threads takes JPEG or PNG up to 8 MB.
+  const keep = (m.mime === "image/png" || m.mime === "image/jpeg") && m.size <= MAX_IMAGE_BYTES;
+  const image = keep ? m : await ctx.media.jpegVariant(m, { maxBytes: MAX_IMAGE_BYTES });
   return { media_type: "IMAGE", image_url: ctx.media.publicUrl(image.file) };
+}
+
+/** Unique links in the text, the way Threads counts them toward its 5-link limit. */
+export function countLinks(text: string): number {
+  const links = (text.match(URL_RE) ?? []).map((u) => u.replace(/[.,;:!?)\]]+$/, "").toLowerCase());
+  return new Set(links).size;
 }
 
 export const threads: Platform = {
@@ -103,6 +115,18 @@ export const threads: Platform = {
     usesTitle: false,
   },
   options: [],
+
+  validate(input) {
+    const errors: string[] = [];
+    for (const m of input.media.filter((x) => x.kind === "video")) {
+      if (!["video/mp4", "video/quicktime", "video/x-m4v"].includes(m.mime)) errors.push("Threads only accepts MP4 or MOV videos.");
+      if (m.size > 1024 ** 3) errors.push("Threads videos must be 1 GB or smaller.");
+      if (m.duration !== null && m.duration > 300) errors.push("Threads videos can be at most 5 minutes long.");
+    }
+    const links = countLinks(input.text);
+    if (links > 5) errors.push(`Threads allows at most 5 links per post (this one has ${links}).`);
+    return errors;
+  },
 
   async publish(ctx) {
     const { accessToken: token } = (await ctx.credentials()) as ThreadsCredentials;
@@ -125,6 +149,7 @@ export const threads: Platform = {
         const id = (await create({ ...(await mediaFields(ctx, m)), is_carousel_item: "true" })).id;
         children.push(id);
       }
+      ctx.progress("Waiting for Threads to process the carousel items…");
       for (const id of children) await waitForContainer(ctx, id, token);
       containerId = (await create({ media_type: "CAROUSEL", children: children.join(","), text })).id;
     }
@@ -133,10 +158,25 @@ export const threads: Platform = {
     await waitForContainer(ctx, containerId, token);
 
     ctx.progress("Publishing on Threads…");
-    const published = await graph<{ id: string }>(`${API}/${userId}/threads_publish`, {
-      method: "POST",
-      form: { creation_id: containerId, access_token: token },
-    });
+    let published: { id: string };
+    try {
+      published = await graph<{ id: string }>(`${API}/${userId}/threads_publish`, {
+        method: "POST",
+        form: { creation_id: containerId, access_token: token },
+      });
+    } catch (err) {
+      if (!isUnknownOutcome(err)) throw err;
+      // Lost response: Threads may have published anyway. Only retry if the container is certainly unpublished.
+      let status: string | null = null;
+      try {
+        status = (await graph(`${API}/${containerId}`, { query: { fields: "status", access_token: token } })).status ?? null;
+      } catch {
+        // unknown
+      }
+      if (status === "PUBLISHED") return { remoteId: containerId, url: null, note: "Published, but Threads didn't confirm it in time." };
+      if (status === "FINISHED") throw err;
+      throw uncertainOutcome("Threads", err);
+    }
     let url: string | null = null;
     try {
       url = (await graph(`${API}/${published.id}`, { query: { fields: "permalink", access_token: token } })).permalink ?? null;
@@ -144,5 +184,11 @@ export const threads: Platform = {
       // nice-to-have
     }
     return { remoteId: published.id, url };
+  },
+
+  async checkConnection(ctx) {
+    const { accessToken: token } = (await ctx.credentials()) as ThreadsCredentials;
+    const me = await graph(`${API}/me`, { query: { fields: "id,username", access_token: token } });
+    return `Can post as @${me.username}.`;
   },
 };

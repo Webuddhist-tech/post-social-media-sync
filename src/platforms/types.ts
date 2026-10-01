@@ -54,8 +54,8 @@ export interface PublishContext<C = any> {
   input: PublishInput;
   config: Config;
   media: MediaStore;
-  /** Current credentials, refreshed first if they're about to expire. */
-  credentials(): Promise<C>;
+  /** Current credentials, refreshed first if they're about to expire (or always, with `force`). */
+  credentials(opts?: { force?: boolean }): Promise<C>;
   /** Reports progress shown live in the dashboard. */
   progress(message: string): void;
   /** Waits (overridable in tests). */
@@ -69,6 +69,13 @@ export interface PublishResult {
   note?: string | null;
 }
 
+/** What a connection check gets: the account and its (refreshed) credentials. */
+export interface CheckContext<C = any> {
+  account: AccountInfo;
+  config: Config;
+  credentials(opts?: { force?: boolean }): Promise<C>;
+}
+
 export interface Platform {
   id: PlatformId;
   name: string;
@@ -78,6 +85,11 @@ export interface Platform {
   /** Platform-specific validation beyond the generic capability checks. Returns error messages. */
   validate?(input: PublishInput, config: Config): string[];
   publish(ctx: PublishContext): Promise<PublishResult>;
+  /**
+   * Checks that the saved login still works, without posting anything. Returns a short description of what the
+   * account can do (e.g. "Can post as @name"). Throws AuthError if the login is no longer valid.
+   */
+  checkConnection(ctx: CheckContext): Promise<string>;
 }
 
 /** A connected account as produced by a connector after login. */

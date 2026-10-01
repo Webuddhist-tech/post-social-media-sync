@@ -126,21 +126,41 @@ const fmtSize = (bytes) => (bytes > 1024 * 1024 ? `${(bytes / 1024 / 1024).toFix
 // ---- text length (mirrors src/text.ts) ----------------------------------------------
 
 const segmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+const graphemes = (text) => (segmenter ? [...segmenter.segment(text)].map((s) => s.segment) : [...text]);
+const EMOJI = (() => {
+  try {
+    return new RegExp("^\\p{RGI_Emoji}$", "v");
+  } catch {
+    return /\p{Extended_Pictographic}/u; // older browsers
+  }
+})();
+const utf8 = new TextEncoder();
+
+/** Approximately how each platform counts characters (the server does the exact check). */
 function measure(platform, text) {
   if (platform === "x") {
+    // Links count 23, each emoji 2, most non-Latin characters 2.
     let n = 0;
-    const rest = text.replace(/https?:\/\/[^\s<>"]+/gi, () => {
+    const rest = text.normalize("NFC").replace(/https?:\/\/[^\s<>"]+/gi, () => {
       n += 23;
       return "";
     });
-    for (const ch of rest) {
-      const cp = ch.codePointAt(0);
-      const light = cp <= 0x10ff || (cp >= 0x2000 && cp <= 0x200d) || (cp >= 0x2010 && cp <= 0x201f) || (cp >= 0x2032 && cp <= 0x2037);
-      n += light ? 1 : 2;
+    for (const g of graphemes(rest)) {
+      if (EMOJI.test(g)) {
+        n += 2;
+        continue;
+      }
+      for (const ch of g) {
+        const cp = ch.codePointAt(0);
+        const light = cp <= 0x10ff || (cp >= 0x2000 && cp <= 0x200d) || (cp >= 0x2010 && cp <= 0x201f) || (cp >= 0x2032 && cp <= 0x2037);
+        n += light ? 1 : 2;
+      }
     }
     return n;
   }
-  if (platform === "bluesky" && segmenter) return [...segmenter.segment(text)].length;
+  if (platform === "bluesky") return graphemes(text).length;
+  if (platform === "threads") return graphemes(text).reduce((n, g) => n + (EMOJI.test(g) ? utf8.encode(g).length : [...g].length), 0);
+  if (platform === "tiktok") return text.length;
   return [...text].length;
 }
 
@@ -344,7 +364,9 @@ function optionField(platform, f) {
     return h("label", { class: "checkbox" }, input, f.label, f.help ? h("span", { class: "help" }, ` — ${f.help}`) : null);
   }
   if (f.type === "select") {
-    const select = h("select", {}, f.choices.map((c) => h("option", { value: c.value, selected: c.value === value }, c.label)));
+    // Options without a default (e.g. TikTok privacy) start on "Choose…" so the person picks deliberately.
+    const placeholder = value === undefined || value === null ? h("option", { value: "", selected: true, disabled: true }, "Choose…") : null;
+    const select = h("select", {}, placeholder, f.choices.map((c) => h("option", { value: c.value, selected: c.value === value }, c.label)));
     select.addEventListener("change", () => set(select.value));
     return h("label", { class: "field" }, h("span", {}, f.label), select, f.help ? h("span", { class: "help" }, f.help) : null);
   }
@@ -809,6 +831,31 @@ async function renderAccounts() {
           a.status !== "active" ? h("div", { class: "help", style: "color:var(--bad)" }, a.statusMessage ?? "Needs to be reconnected") : null,
         ),
         a.status === "active" ? h("span", { class: "tag tag-ok" }, "Active") : h("span", { class: "tag tag-bad" }, "Reconnect"),
+        h(
+          "button",
+          {
+            class: "btn btn-sm",
+            type: "button",
+            title: "Checks that the login still works, without posting anything",
+            onclick: async (e) => {
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              btn.textContent = "Testing…";
+              try {
+                const res = await api(`/accounts/${a.id}/check`, { method: "POST" });
+                if (res.ok) toast(`${a.name} (${platformName(a.platform)}): ${res.detail}`, "ok");
+                else toast(`${a.name} (${platformName(a.platform)}): ${res.error}`, "bad");
+                if (res.ok === (a.status !== "active") || res.needsReconnect) await renderAccounts();
+              } catch (err) {
+                toast(err.message, "bad");
+              } finally {
+                btn.disabled = false;
+                btn.textContent = "Test";
+              }
+            },
+          },
+          "Test",
+        ),
         a.status !== "active" && connector?.kind === "oauth"
           ? h("a", { class: "btn btn-sm", href: `/connect/${a.connector}` }, "Reconnect")
           : null,

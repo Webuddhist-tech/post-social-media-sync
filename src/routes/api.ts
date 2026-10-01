@@ -1,8 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { isPrivateBaseUrl } from "../config.js";
-import { UserError } from "../http.js";
+import { AuthError, UserError } from "../http.js";
 import { hasFfmpeg, SUPPORTED_MIME_TYPES } from "../media.js";
-import { CONNECTORS, getConnector, PLATFORMS } from "../platforms/index.js";
+import { CONNECTORS, getConnector, getPlatform, PLATFORMS } from "../platforms/index.js";
 import type { PostRequest } from "../posts.js";
 import { redirectUri } from "./oauth.js";
 
@@ -85,6 +85,26 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       }
       if (!db.deleteAccount(req.params.id)) return reply.code(404).send({ error: "Account not found." });
       return { ok: true };
+    });
+
+    /** Checks that a saved login still works, without posting anything. */
+    api.post<{ Params: { id: string } }>("/accounts/:id/check", async (req, reply) => {
+      const row = db.getAccount(req.params.id);
+      const platform = row && getPlatform(row.platform);
+      if (!row || !platform) return reply.code(404).send({ error: "Account not found." });
+      try {
+        const detail = await platform.checkConnection({
+          account: accounts.info(row),
+          config,
+          credentials: (opts) => accounts.credentials(row.id, opts),
+        });
+        db.markAccountActive(row.id);
+        return { ok: true, detail };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof AuthError) db.markAccountNeedsReauth(row.id, message);
+        return { ok: false, error: message, needsReconnect: err instanceof AuthError };
+      }
     });
 
     api.post<{ Params: { connector: string }; Body: { fields?: Record<string, string> } }>(

@@ -21,6 +21,11 @@ export interface WorkerDeps {
   tickMs?: number;
 }
 
+function formatDelay(ms: number): string {
+  const min = Math.round(ms / 60_000);
+  return min < 60 ? `${Math.max(1, min)} min` : `${Math.round(min / 60)} h`;
+}
+
 /** Runs queued publish jobs in the background, one job per account at a time. */
 export class Worker {
   private running = new Map<string, Promise<void>>(); // targetId -> job
@@ -100,7 +105,7 @@ export class Worker {
         input: posts.inputFor(target, post),
         config,
         media,
-        credentials: () => accounts.credentials(account.id),
+        credentials: (opts) => accounts.credentials(account.id, opts),
         progress: (message) => {
           if (message === lastProgress) return;
           lastProgress = message;
@@ -120,8 +125,10 @@ export class Worker {
       }
       const retryable = err instanceof ApiError && err.retryable && !(err instanceof UserError);
       if (retryable && target.attempts < config.maxAttempts) {
-        const delay = RETRY_DELAYS_MS[Math.min(target.attempts - 1, RETRY_DELAYS_MS.length - 1)];
-        db.failTarget(target.id, `${message} — retrying in ${Math.round(delay / 60_000)} min`, Date.now() + delay);
+        // Wait at least as long as the platform asked (rate-limit reset), but no more than a day.
+        const fixed = RETRY_DELAYS_MS[Math.min(target.attempts - 1, RETRY_DELAYS_MS.length - 1)];
+        const delay = Math.min(Math.max(fixed, (err as ApiError).retryAfterMs ?? 0), 24 * 3600_000);
+        db.failTarget(target.id, `${message} — retrying in ${formatDelay(delay)}`, Date.now() + delay + 1000);
         log.warn({ target: target.id, err: message }, `publishing to ${label} failed, will retry`);
       } else {
         db.failTarget(target.id, message, null);

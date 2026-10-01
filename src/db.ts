@@ -194,6 +194,9 @@ export function openDatabase(file: string) {
     markAccountNeedsReauth(id: string, message: string): void {
       db.prepare("UPDATE accounts SET status = 'needs_reauth', status_message = ?, updated_at = ? WHERE id = ?").run(message, now(), id);
     },
+    markAccountActive(id: string): void {
+      db.prepare("UPDATE accounts SET status = 'active', status_message = NULL, updated_at = ? WHERE id = ?").run(now(), id);
+    },
     deleteAccount(id: string): boolean {
       return db.prepare("DELETE FROM accounts WHERE id = ?").run(id).changes > 0;
     },

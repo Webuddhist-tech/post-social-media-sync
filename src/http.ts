@@ -1,15 +1,20 @@
 /** Small fetch wrapper with consistent error handling for all platform APIs. */
 
 export class ApiError extends Error {
+  /** For rate limits: how long the platform asked us to wait before trying again. */
+  readonly retryAfterMs: number | null;
+
   constructor(
     message: string,
     readonly status: number,
     readonly body: unknown,
     /** Whether retrying later has a reasonable chance of succeeding (rate limits, 5xx, network). */
     readonly retryable: boolean,
+    extra: { retryAfterMs?: number | null } = {},
   ) {
     super(message);
     this.name = "ApiError";
+    this.retryAfterMs = extra.retryAfterMs ?? null;
   }
 }
 
@@ -49,6 +54,8 @@ export interface HttpResponse<T = any> {
   status: number;
   headers: Headers;
   data: T;
+  /** The raw body (e.g. to read 64-bit ids that JSON.parse would round). */
+  text: string;
 }
 
 function withQuery(url: string, query?: RequestOptions["query"]): string {
@@ -89,8 +96,14 @@ export function extractErrorMessage(body: unknown): string | null {
     const detail = b.error_description ?? b.message;
     return typeof detail === "string" && detail ? `${b.error}: ${detail}` : b.error;
   }
-  // X: { title, detail, errors: [{ message }] }
-  if (typeof b.detail === "string") return b.title ? `${b.title}: ${b.detail}` : b.detail;
+  // X: { title, detail, errors: [{ message }] }. The specific reason is often only in errors[].message.
+  if (typeof b.detail === "string") {
+    const head = b.title ? `${b.title}: ${b.detail}` : b.detail;
+    const specific = Array.isArray(b.errors)
+      ? [...new Set(b.errors.map((e: any) => e?.message).filter((m: unknown) => typeof m === "string" && m && m !== b.detail))]
+      : [];
+    return specific.length ? `${head} — ${specific.join("; ")}` : head;
+  }
   if (Array.isArray(b.errors) && b.errors.length) {
     return b.errors.map((e: any) => e?.message ?? e?.detail ?? JSON.stringify(e)).join("; ");
   }
@@ -98,6 +111,51 @@ export function extractErrorMessage(body: unknown): string | null {
   if (typeof b.message === "string") return b.message;
   if (typeof b.error_message === "string") return b.error_message;
   return JSON.stringify(body).slice(0, 500);
+}
+
+/** How long a 429 response asks us to wait (Retry-After, or X's rate-limit reset headers). */
+export function retryAfterMs(headers: Headers, now = Date.now()): number | null {
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter) {
+    const secs = Number(retryAfter);
+    if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+    const at = Date.parse(retryAfter);
+    if (Number.isFinite(at)) return Math.max(0, at - now);
+  }
+  // X: the 24-hour per-user cap wins when it is exhausted, else the 15-minute window.
+  const dailyReset = headers.get("x-user-limit-24hour-reset");
+  const reset = headers.get("x-user-limit-24hour-remaining") === "0" && dailyReset ? dailyReset : headers.get("x-rate-limit-reset");
+  if (reset && Number.isFinite(Number(reset))) return Math.max(0, Number(reset) * 1000 - now);
+  return null;
+}
+
+/** A network failure, timeout or server error: we can't tell whether the platform acted on the request. */
+export function isUnknownOutcome(err: unknown): err is ApiError {
+  return err instanceof ApiError && err.retryable && (err.status === 0 || err.status >= 500);
+}
+
+/**
+ * Wraps the request that makes a post public. If it fails with an unknown outcome (network error, timeout, 5xx),
+ * the post may be live already, so we must not let the queue retry it automatically and publish a duplicate.
+ * Rate-limit errors are still retried: the platform explicitly refused, so nothing was created.
+ */
+export async function publishStep<T>(platformName: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (isUnknownOutcome(err)) throw uncertainOutcome(platformName, err);
+    throw err;
+  }
+}
+
+/** A non-retryable error explaining that the post may be live despite the failure. */
+export function uncertainOutcome(platformName: string, err: ApiError): ApiError {
+  return new ApiError(
+    `${platformName} may have published this post even though the request failed (${err.message}). Check ${platformName} before retrying.`,
+    err.status,
+    err.body,
+    false,
+  );
 }
 
 export async function request<T = any>(url: string, opts: RequestOptions = {}): Promise<HttpResponse<T>> {
@@ -143,9 +201,11 @@ export async function request<T = any>(url: string, opts: RequestOptions = {}): 
     const detail = extractErrorMessage(data) ?? res.statusText;
     if (res.status === 401) throw new AuthError(`${host} rejected the access token (401): ${detail}`);
     const retryable = res.status === 429 || res.status >= 500;
-    throw new ApiError(`${host} returned ${res.status}: ${detail}`, res.status, data, retryable);
+    throw new ApiError(`${host} returned ${res.status}: ${detail}`, res.status, data, retryable, {
+      retryAfterMs: res.status === 429 ? retryAfterMs(res.headers) : null,
+    });
   }
-  return { status: res.status, headers: res.headers, data: data as T };
+  return { status: res.status, headers: res.headers, data: data as T, text };
 }
 
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { ApiError, AuthError, UserError } from "../src/http.js";
-import { bluesky } from "../src/platforms/bluesky.js";
+import { bluesky, clearBlueskySessions } from "../src/platforms/bluesky.js";
 import { facebook } from "../src/platforms/facebook.js";
 import { instagram } from "../src/platforms/instagram.js";
 import { linkedin, resetLinkedInVersionCache } from "../src/platforms/linkedin.js";
@@ -11,6 +11,8 @@ import { youtube } from "../src/platforms/youtube.js";
 import { fakeMedia, form, json, makeCtx, mockFetch, testConfig } from "./helpers.js";
 
 const G = "https://graph.facebook.com/v26.0";
+
+beforeEach(() => clearBlueskySessions());
 
 describe("Facebook", () => {
   const config = testConfig();
@@ -112,12 +114,20 @@ describe("Facebook", () => {
 
 describe("Instagram", () => {
   const config = testConfig();
+  /** Batched container status: GET /?ids=a,b&fields=status_code,status */
+  const statusRoute = (status: (id: string, n: number) => string) => ({
+    method: "GET",
+    match: `${G}/?ids=`,
+    reply: (c: { url: URL }, n: number) => ({
+      json: Object.fromEntries(c.url.searchParams.get("ids")!.split(",").map((id) => [id, { id, status_code: status(id, n) }])),
+    }),
+  });
 
   it("publishes a photo from its public URL", async () => {
     const { calls } = mockFetch([
       { method: "POST", match: `${G}/ig-1/media_publish`, reply: () => ({ json: { id: "media-77" } }) },
       { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: "container-1" } }) },
-      { method: "GET", match: `${G}/container-1`, reply: () => ({ json: { status_code: "FINISHED" } }) },
+      statusRoute(() => "FINISHED"),
       { method: "GET", match: `${G}/media-77`, reply: () => ({ json: { permalink: "https://www.instagram.com/p/abc/" } }) },
     ]);
     const photo = fakeMedia(config, { kind: "image" });
@@ -132,6 +142,7 @@ describe("Instagram", () => {
     const body = form(calls[0]);
     expect(body.caption).toBe("Sunset");
     expect(body.image_url).toMatch(new RegExp(`^https://posts\\.example\\.com/media/[\\w-]+/${photo.file}$`));
+    expect(calls[1].url.searchParams.get("ids")).toBe("container-1");
     expect(form(calls[2])).toEqual({ creation_id: "container-1", access_token: "T" });
   });
 
@@ -144,7 +155,7 @@ describe("Instagram", () => {
         reply: () => ({ json: { id: "c-9", uri: "https://rupload.facebook.com/ig-api-upload/v26.0/c-9" } }),
       },
       { method: "POST", match: "https://rupload.facebook.com/ig-api-upload/v26.0/c-9", reply: () => ({ json: { success: true } }) },
-      { method: "GET", match: `${G}/c-9`, reply: (_c, n) => ({ json: { status_code: n < 3 ? "IN_PROGRESS" : "FINISHED" } }) },
+      statusRoute((_id, n) => (n < 3 ? "IN_PROGRESS" : "FINISHED")),
       { method: "GET", match: `${G}/reel-1`, reply: () => ({ json: { permalink: "https://www.instagram.com/reel/xyz/" } }) },
     ]);
     const video = fakeMedia(config, { kind: "video", size: 2048 });
@@ -165,15 +176,15 @@ describe("Instagram", () => {
     });
     expect(calls[1].headers.get("file_size")).toBe("2048");
     expect(calls[1].headers.get("authorization")).toBe("OAuth T");
-    expect(calls.filter((c) => c.url.pathname.endsWith("/c-9") && c.method === "GET")).toHaveLength(3);
+    expect(calls.filter((c) => c.url.searchParams.get("ids") === "c-9")).toHaveLength(3);
   });
 
-  it("builds carousels from child containers", async () => {
+  it("builds carousels: creates every item, then checks them all in one request", async () => {
     let n = 0;
     const { calls } = mockFetch([
       { method: "POST", match: `${G}/ig-1/media_publish`, reply: () => ({ json: { id: "post-1" } }) },
       { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: `c-${++n}` } }) },
-      { method: "GET", match: /\/c-\d\?/, reply: () => ({ json: { status_code: "FINISHED" } }) },
+      statusRoute(() => "FINISHED"),
       { method: "GET", match: `${G}/post-1`, reply: () => ({ json: { permalink: "https://www.instagram.com/p/car/" } }) },
     ]);
     const ctx = makeCtx(instagram, {
@@ -187,12 +198,18 @@ describe("Instagram", () => {
     expect(creates[0].is_carousel_item).toBe("true");
     expect(creates[1].is_carousel_item).toBe("true");
     expect(creates[2]).toMatchObject({ media_type: "CAROUSEL", children: "c-1,c-2", caption: "Carousel" });
+    const polls = calls.filter((c) => c.url.searchParams.has("ids")).map((c) => c.url.searchParams.get("ids"));
+    expect(polls).toEqual(["c-1,c-2", "c-3"]);
   });
 
   it("fails clearly when Instagram can't process the media", async () => {
     mockFetch([
       { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: "c-1" } }) },
-      { method: "GET", match: `${G}/c-1`, reply: () => ({ json: { status_code: "ERROR", status: "Error: unsupported aspect ratio" } }) },
+      {
+        method: "GET",
+        match: `${G}/?ids=`,
+        reply: () => ({ json: { "c-1": { id: "c-1", status_code: "ERROR", status: "Error: unsupported aspect ratio" } } }),
+      },
     ]);
     const ctx = makeCtx(instagram, {
       config,
@@ -254,7 +271,7 @@ describe("TikTok", () => {
     const ctx = makeCtx(tiktokPlatform, {
       config,
       credentials: { accessToken: "TT" },
-      input: { text: "Dance #fyp", media: [video], options: { privacyLevel: "PUBLIC_TO_EVERYONE", allowComments: false } },
+      input: { text: "Dance #fyp", media: [video], options: { privacyLevel: "PUBLIC_TO_EVERYONE", allowStitch: true } },
     });
     const res = await tiktokPlatform.publish(ctx);
     expect(res).toMatchObject({ remoteId: "7311", url: "https://www.tiktok.com/@lotus/video/7311" });
@@ -263,9 +280,9 @@ describe("TikTok", () => {
     expect(init.post_info).toEqual({
       title: "Dance #fyp",
       privacy_level: "PUBLIC_TO_EVERYONE",
-      disable_comment: true,
-      disable_duet: true, // creator has duets turned off
-      disable_stitch: false,
+      disable_comment: true, // interactions are off unless turned on
+      disable_duet: true,
+      disable_stitch: false, // turned on above, and allowed by the creator's settings
       brand_organic_toggle: false,
       brand_content_toggle: false,
       is_aigc: false,
@@ -307,9 +324,9 @@ describe("TikTok", () => {
     const ctx = makeCtx(tiktokPlatform, {
       config,
       credentials: { accessToken: "TT" },
-      input: { text: "x", media: [fakeMedia(config, { kind: "video" })] },
+      input: { text: "x", media: [fakeMedia(config, { kind: "video" })], options: { privacyLevel: "PUBLIC_TO_EVERYONE" } },
     });
-    await expect(tiktokPlatform.publish(ctx)).rejects.toThrow(/hasn't passed TikTok's audit/);
+    await expect(tiktokPlatform.publish(ctx)).rejects.toThrow(/hasn't passed TikTok's audit yet.*set your TikTok account to Private/);
   });
 
   it("can send the video to the TikTok inbox instead", async () => {

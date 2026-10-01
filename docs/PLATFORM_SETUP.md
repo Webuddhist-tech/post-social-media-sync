@@ -21,6 +21,9 @@ The **Setup** tab in the dashboard shows the exact *redirect URI* to paste into 
 | Bluesky | – | none | Yes, with an app password. |
 
 > **Tip:** start with Bluesky. It needs no developer app, so you can check the whole flow in two minutes.
+>
+> After connecting any account, click **Test** next to it on the Accounts tab. It checks that the login works
+> (and, for TikTok, shows which privacy options the account has) without posting anything.
 
 Developer consoles get redesigned often, so menu names below may differ slightly. The values you need (IDs,
 secrets, redirect URI, permissions) stay the same.
@@ -68,17 +71,24 @@ Steps:
    account in Post Sync.
 
 Good to know:
+- If your role on the Page comes from **Business Manager** (common for agencies), Meta also requires the
+  `ads_read` permission to publish to Instagram. Add it to the app, set `META_EXTRA_SCOPES=ads_read` (or add it to
+  your Login for Business configuration) and reconnect.
+- Post Sync only connects Pages your role can create content on, and skips Instagram accounts if you declined the
+  Instagram permissions in Meta's dialog.
 - While the app is in development mode only people with a role on the app (admin, developer, tester) can connect.
   That's fine for your own accounts. To let others connect, submit the permissions for **App Review** (Meta also
   asks for business verification).
 - Facebook Page tokens obtained this way don't expire. If you change your Facebook password or remove the app,
   just reconnect.
 - **Instagram:** photos must be JPEG with an aspect ratio between 4:5 and 1.91:1 (Post Sync converts PNG/WebP to
-  JPEG automatically; crop images that are too tall/wide). Videos are published as **Reels** and uploaded
-  directly, so they work without a public URL; photos need `PUBLIC_BASE_URL` to be reachable from the internet.
-  Up to 10 items become a carousel. Instagram limits API publishing per account per 24 hours.
-- **Facebook:** text, links, up to 10 photos, or one video. In the post settings you can choose to publish a
-  video as a **Reel** instead of a regular video post.
+  JPEG automatically; crop images that are too tall/wide). Videos are published as **Reels** (MP4/MOV, 3 seconds
+  to 15 minutes, up to 300 MB) and uploaded directly, so they work without a public URL; photos need
+  `PUBLIC_BASE_URL` to be reachable from the internet. Up to 10 items become a carousel (videos in a carousel:
+  3–60 seconds). Captions: up to 2,200 characters, 30 hashtags and 20 @mentions. Instagram limits API publishing per
+  account per 24 hours.
+- **Facebook:** text, links, up to 10 photos (photos over 4 MB are shrunk automatically), or one video (up to
+  1 GB / 20 minutes). In the post settings you can publish a video as a **Reel** instead (vertical, 3–90 seconds).
 
 ## TikTok
 
@@ -91,12 +101,14 @@ Good to know:
 6. Restart and connect TikTok from the Accounts tab.
 
 Good to know:
-- **Until TikTok audits your app, every direct post is private ("Only me")** and only a few accounts can connect.
+- **Until TikTok audits your app, every direct post is private ("Only me")**, the TikTok account itself must be
+  set to **Private** in the TikTok app, and at most 5 accounts can post per day.
   Pick "Only me" in the TikTok settings of a post, or choose **Send to TikTok inbox**, which puts the video in
   your TikTok inbox so you can finish and publish it from the app. To post publicly, submit the app for TikTok's
   audit. TikTok reviews the posting screen against its content sharing guidelines (privacy choice, interaction
-  settings, commercial content disclosure, and more). Post Sync's composer has these settings, but TikTok may
-  still ask for changes, such as having no default privacy level.
+  settings, commercial content disclosure, and more). Following those rules, Post Sync makes you pick the privacy
+  level for every TikTok post (there is no default) and leaves comments, Duet and Stitch off unless you turn them
+  on.
 - If your app only has inbox-upload access, set `TIKTOK_SCOPES=user.info.basic,video.upload` and always use
   "Send to TikTok inbox".
 - TikTok posts need exactly one video. The allowed length depends on the account (Post Sync checks it).
@@ -157,8 +169,8 @@ Good to know:
    `THREADS_APP_ID` / `THREADS_APP_SECRET`, restart, and connect.
 
 Good to know: Threads downloads photos and videos from `PUBLIC_BASE_URL`, so it must be public. Text posts work
-without that. Posts are limited to 500 characters; up to 20 items become a carousel. Post Sync refreshes the
-60-day token automatically.
+without that. Posts are limited to 500 characters (each emoji counts as several) and at most 5 links; up to 20 items
+become a carousel. Videos: MP4/MOV, up to 1 GB and 5 minutes. Post Sync refreshes the 60-day token automatically.
 
 ## X (Twitter)
 
@@ -169,8 +181,8 @@ without that. Posts are limited to 500 characters; up to 20 items become a carou
    `X_CLIENT_SECRET`, restart, and connect.
 
 Good to know: posting through the X API is a paid feature; check the current plans/pricing in the developer
-portal. Up to 4 photos or 1 video per post. If your account has X Premium, tick "Account has X Premium" in the
-post settings to allow long posts.
+portal. Up to 4 photos (shrunk to 5 MB if bigger) or 1 video (up to 512 MB and 2:20) per post. If your account
+has X Premium, tick "Account has X Premium" in the post settings to allow long posts and longer videos.
 
 ## Bluesky
 
@@ -180,6 +192,6 @@ No developer app needed.
 2. In Post Sync: **Accounts → Bluesky**, enter your handle (e.g. `you.bsky.social`) and the app password.
    If your account lives on a self-hosted server, enter its address under *Server*.
 
-Good to know: posts are limited to 300 characters. Up to 4 images (Post Sync compresses them under Bluesky's
-1 MB limit) or one video (up to 3 minutes / 100 MB; Bluesky requires a verified email for video). Links,
+Good to know: posts are limited to 300 characters. Up to 4 images (Post Sync compresses anything over Bluesky's
+2 MB limit) or one video (up to 10 minutes / 300 MB; Bluesky requires a verified email for video). Links,
 #hashtags and @mentions become clickable automatically.

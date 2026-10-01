@@ -19,8 +19,18 @@ export function graphUrl(config: Config, path: string, host = "graph.facebook.co
   return `https://${host}/${config.meta.graphVersion}/${path.replace(/^\//, "")}`;
 }
 
+/** Meta's temporary error codes: worth retrying later. */
+export function isTransientMetaError(e: any): boolean {
+  const code = Number(e?.code);
+  if (e?.is_transient === true) return true;
+  // 1/2 = temporary, 4/17/32/341/613 = app/user rate limits, 80000-80014 = Business Use Case (per Page/IG account)
+  // rate limits, 368/1390008 = "posting too fast" block.
+  if ([1, 2, 4, 17, 32, 341, 613].includes(code) || (code >= 80000 && code <= 80014)) return true;
+  return code === 368 && Number(e?.error_subcode) === 1390008;
+}
+
 /** Graph API call with Meta's error codes mapped to retry/re-auth semantics. */
-export async function graph<T = any>(url: string, opts: RequestOptions = {}): Promise<T> {
+export async function graph<T = any>(url: string, opts: RequestOptions = {}, context: { permissionHint?: string } = {}): Promise<T> {
   try {
     return (await request<T>(url, opts)).data;
   } catch (err) {
@@ -30,30 +40,13 @@ export async function graph<T = any>(url: string, opts: RequestOptions = {}): Pr
       if (code === 190 || code === 102) {
         throw new AuthError(`Meta says the access token is no longer valid (${e?.message ?? "code 190"}). Reconnect the account.`);
       }
-      // 1/2 = temporary, 4/17/32/613 = rate limits, 368 = temporarily blocked for policy reasons.
-      const transient = e?.is_transient === true || [1, 2, 4, 17, 32, 341, 613].includes(code);
-      if (transient && !err.retryable) throw new ApiError(err.message, err.status, err.body, true);
+      if (isTransientMetaError(e) && !err.retryable) throw new ApiError(err.message, err.status, err.body, true);
+      // (#10) / (#200-299): the app or the person lacks a permission.
+      if (context.permissionHint && (code === 10 || (code >= 200 && code <= 299))) {
+        throw new UserError(`${err.message}. ${context.permissionHint}`);
+      }
     }
     throw err;
-  }
-}
-
-/** Polls `check` until it returns a value, or throws after `timeoutMs`. */
-export async function pollUntil<T>(
-  sleep: (ms: number) => Promise<void>,
-  check: () => Promise<T | null>,
-  opts: { intervalMs: number; timeoutMs: number; what: string },
-): Promise<T> {
-  const deadline = Date.now() + opts.timeoutMs;
-  let interval = opts.intervalMs;
-  for (;;) {
-    const result = await check();
-    if (result !== null) return result;
-    if (Date.now() > deadline) {
-      throw new ApiError(`Timed out after ${Math.round(opts.timeoutMs / 60000)} min waiting for ${opts.what}`, 0, null, false);
-    }
-    await sleep(interval);
-    interval = Math.min(interval * 1.5, 30_000);
   }
 }
 
@@ -74,7 +67,7 @@ export const metaConnector: Connector = {
     u.searchParams.set("response_type", "code");
     // "Facebook Login for Business" apps use a configuration ID instead of a scope list.
     if (config.meta.loginConfigId) u.searchParams.set("config_id", config.meta.loginConfigId);
-    else u.searchParams.set("scope", META_SCOPES.join(","));
+    else u.searchParams.set("scope", [...new Set([...META_SCOPES, ...config.meta.extraScopes])].join(","));
     return u.toString();
   },
 
@@ -92,10 +85,22 @@ export const metaConnector: Connector = {
       },
     });
 
+    // People can untick permissions in the login dialog; find out what was actually granted.
+    const granted = new Set<string>();
+    try {
+      const perms = await graph(graphUrl(config, "me/permissions"), { query: { access_token: long.access_token } });
+      for (const p of perms.data ?? []) if (p.status === "granted") granted.add(p.permission);
+    } catch {
+      // If we can't tell, assume everything was granted and let publishing report problems.
+      META_SCOPES.forEach((p) => granted.add(p));
+    }
+    const canFacebook = ["pages_show_list", "pages_manage_posts"].every((p) => granted.has(p));
+    const canInstagram = ["instagram_basic", "instagram_content_publish"].every((p) => granted.has(p));
+
     const pages: any[] = [];
     let next: string | null = graphUrl(config, "me/accounts");
     let query: RequestOptions["query"] = {
-      fields: "id,name,access_token,picture{url},instagram_business_account{id,username,name,profile_picture_url}",
+      fields: "id,name,access_token,tasks,picture{url},instagram_business_account{id,username,name,profile_picture_url}",
       limit: 100,
       access_token: long.access_token,
     };
@@ -114,17 +119,28 @@ export const metaConnector: Connector = {
     }
 
     const drafts: AccountDraft[] = [];
+    const skipped: string[] = [];
     for (const page of pages) {
-      drafts.push({
-        platform: "facebook",
-        externalId: page.id,
-        name: page.name,
-        avatarUrl: page.picture?.data?.url ?? null,
-        credentials: { pageAccessToken: page.access_token },
-        expiresAt: null,
-      });
+      // Pages listed through a Business the person has no role on come back without a token.
+      if (!page.access_token) {
+        skipped.push(`${page.name} (no access token, ask for a role on the Page)`);
+        continue;
+      }
+      const tasks: string[] | undefined = page.tasks;
+      if (canFacebook && (!tasks || tasks.includes("CREATE_CONTENT"))) {
+        drafts.push({
+          platform: "facebook",
+          externalId: page.id,
+          name: page.name,
+          avatarUrl: page.picture?.data?.url ?? null,
+          credentials: { pageAccessToken: page.access_token },
+          expiresAt: null,
+        });
+      } else if (canFacebook) {
+        skipped.push(`${page.name} (your role on this Page can't create posts)`);
+      }
       const ig = page.instagram_business_account;
-      if (ig?.id) {
+      if (ig?.id && canInstagram) {
         drafts.push({
           platform: "instagram",
           externalId: ig.id,
@@ -136,6 +152,14 @@ export const metaConnector: Connector = {
           expiresAt: null,
         });
       }
+    }
+    if (drafts.length === 0) {
+      const missing = [...META_SCOPES].filter((p) => !granted.has(p));
+      throw new UserError(
+        "None of your Pages can be posted to. " +
+          (missing.length ? `These permissions were not granted: ${missing.join(", ")}. Connect again and allow them. ` : "") +
+          (skipped.length ? `Skipped: ${skipped.join("; ")}.` : ""),
+      );
     }
     return drafts;
   },

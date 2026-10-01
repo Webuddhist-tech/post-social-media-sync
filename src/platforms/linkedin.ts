@@ -1,7 +1,7 @@
 import type { Config } from "../config.js";
-import { ApiError, request, type HttpResponse, type RequestOptions } from "../http.js";
+import { ApiError, publishStep, request, type HttpResponse, type RequestOptions } from "../http.js";
 import { readRange, type MediaFile } from "../media.js";
-import { pollUntil } from "./meta.js";
+import { pollUntil } from "./common.js";
 import type { AccountDraft, Connector, Platform, PublishContext } from "./types.js";
 
 const REST = "https://api.linkedin.com/rest";
@@ -151,12 +151,22 @@ export const linkedinConnector: Connector = {
     ];
 
     if (config.linkedin.organizations) {
-      const acls = await li(config, "organizationAcls", t.access_token, {
-        query: { q: "roleAssignee", role: "ADMINISTRATOR", state: "APPROVED" },
-      });
-      for (const el of acls.data?.elements ?? []) {
-        const urn: string = el.organization ?? el.organizationTarget;
-        if (!urn) continue;
+      // Admins and Content Admins can post as the Page. Each (Page, role) pair is its own row, so dedupe.
+      const orgs = new Set<string>();
+      const count = 100;
+      for (let start = 0; start < 2000; start += count) {
+        const acls = await li(config, "organizationAcls", t.access_token, {
+          query: { q: "roleAssignee", state: "APPROVED", start, count },
+        });
+        const elements: any[] = acls.data?.elements ?? [];
+        for (const el of elements) {
+          const urn: string | undefined = el.organization ?? el.organizationTarget;
+          if (urn && ["ADMINISTRATOR", "CONTENT_ADMINISTRATOR"].includes(el.role)) orgs.add(urn);
+        }
+        const total = acls.data?.paging?.total;
+        if (elements.length < count || (typeof total === "number" && start + count >= total)) break;
+      }
+      for (const urn of orgs) {
         const id = urn.split(":").pop()!;
         let name = `LinkedIn Page ${id}`;
         let username: string | null = null;
@@ -194,9 +204,13 @@ export const linkedinConnector: Connector = {
   },
 };
 
+const MAX_IMAGE_PIXELS = 36_152_320; // LinkedIn rejects images with this many pixels or more
+
 async function uploadImage(ctx: PublishContext, token: string, owner: string, image: MediaFile): Promise<string> {
-  // LinkedIn accepts JPEG, PNG and GIF.
-  const file = ["image/jpeg", "image/png", "image/gif"].includes(image.mime) ? image : await ctx.media.jpegVariant(image);
+  // LinkedIn accepts JPEG, PNG and GIF below ~36 megapixels.
+  const tooBig = (image.width ?? 0) * (image.height ?? 0) >= MAX_IMAGE_PIXELS && image.mime !== "image/gif";
+  const supported = ["image/jpeg", "image/png", "image/gif"].includes(image.mime);
+  const file = supported && !tooBig ? image : await ctx.media.jpegVariant(image, { maxDimension: 6000 });
   const init = await li(ctx.config, "images?action=initializeUpload", token, {
     method: "POST",
     json: { initializeUploadRequest: { owner } },
@@ -209,6 +223,30 @@ async function uploadImage(ctx: PublishContext, token: string, owner: string, im
     timeoutMs: 10 * 60_000,
   });
   return urn;
+}
+
+/** LinkedIn processes uploaded images asynchronously; posts should reference them once they're AVAILABLE. */
+async function waitForImages(ctx: PublishContext, token: string, urns: string[]): Promise<void> {
+  for (const urn of urns) {
+    try {
+      await pollUntil(
+        ctx.sleep,
+        async () => {
+          const status = (await li(ctx.config, `images/${encodeURIComponent(urn)}`, token)).data?.status;
+          if (status === "PROCESSING_FAILED") throw new Error("LinkedIn couldn't process one of the images.");
+          return status === "AVAILABLE" ? true : null;
+        },
+        { intervalMs: 1500, maxIntervalMs: 10_000, timeoutMs: 3 * 60_000, what: "LinkedIn to process the images" },
+      );
+    } catch (err) {
+      // Member tokens (w_member_social) may not be allowed to read image status: give LinkedIn a moment instead.
+      if (err instanceof ApiError && (err.status === 403 || err.status === 404)) {
+        await ctx.sleep(5000);
+        return;
+      }
+      throw err;
+    }
+  }
 }
 
 async function uploadVideo(ctx: PublishContext, token: string, owner: string, video: MediaFile): Promise<string> {
@@ -281,6 +319,11 @@ export const linkedin: Platform = {
 
   validate(input) {
     const errors: string[] = [];
+    for (const m of input.media) {
+      if (m.mime === "image/gif" && (m.width ?? 0) * (m.height ?? 0) >= MAX_IMAGE_PIXELS) {
+        errors.push(`"${m.filename}" is too large for LinkedIn (GIFs must be under 36 megapixels).`);
+      }
+    }
     const video = input.media.find((m) => m.kind === "video");
     if (video) {
       if (!["video/mp4", "video/x-m4v"].includes(video.mime)) errors.push("LinkedIn only accepts MP4 videos.");
@@ -308,26 +351,39 @@ export const linkedin: Platform = {
         ctx.progress(`Uploading image ${i + 1} of ${media.length} to LinkedIn…`);
         urns.push(await uploadImage(ctx, token, author, m));
       }
+      ctx.progress("Waiting for LinkedIn to process the images…");
+      await waitForImages(ctx, token, urns);
       content = urns.length === 1 ? { media: { id: urns[0] } } : { multiImage: { images: urns.map((id) => ({ id })) } };
     }
 
     ctx.progress("Publishing on LinkedIn…");
     const visibility = isOrg ? "PUBLIC" : ctx.input.options.visibility === "CONNECTIONS" ? "CONNECTIONS" : "PUBLIC";
-    const res = await li(ctx.config, "posts", token, {
-      method: "POST",
-      json: {
-        author,
-        commentary: toLittleText(ctx.input.text),
-        visibility,
-        distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
-        ...(content ? { content } : {}),
-        lifecycleState: "PUBLISHED",
-        isReshareDisabledByAuthor: false,
-      },
-    });
+    const res = await publishStep("LinkedIn", () =>
+      li(ctx.config, "posts", token, {
+        method: "POST",
+        json: {
+          author,
+          commentary: toLittleText(ctx.input.text),
+          visibility,
+          distribution: { feedDistribution: "MAIN_FEED", targetEntities: [], thirdPartyDistributionChannels: [] },
+          ...(content ? { content } : {}),
+          lifecycleState: "PUBLISHED",
+          isReshareDisabledByAuthor: false,
+        },
+      }),
+    );
     const urn = res.headers.get("x-restli-id") ?? res.headers.get("x-linkedin-id");
     // Never fail after LinkedIn accepted the post: a retry would publish it twice.
     if (!urn) return { remoteId: "unknown", url: null, note: "Posted, but LinkedIn didn't return a link." };
     return { remoteId: urn, url: `https://www.linkedin.com/feed/update/${urn}/` };
+  },
+
+  async checkConnection(ctx) {
+    const { accessToken: token } = (await ctx.credentials()) as LinkedInCredentials;
+    const me = (await request("https://api.linkedin.com/v2/userinfo", { headers: { Authorization: `Bearer ${token}` } })).data;
+    const who = me.name ?? "your LinkedIn profile";
+    return ctx.account.externalId.startsWith("urn:li:organization:")
+      ? `Logged in as ${who}; can post as the Page "${ctx.account.name}".`
+      : `Can post as ${who}.`;
   },
 };

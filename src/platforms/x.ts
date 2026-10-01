@@ -1,6 +1,7 @@
-import { ApiError, AuthError, request, type RequestOptions } from "../http.js";
+import { ApiError, AuthError, publishStep, request, type RequestOptions } from "../http.js";
 import { readRange, type MediaFile } from "../media.js";
 import type { Config } from "../config.js";
+import { withFreshToken } from "./common.js";
 import type { Connector, Platform, PublishContext } from "./types.js";
 
 const API = "https://api.x.com/2";
@@ -95,17 +96,29 @@ export const xConnector: Connector = {
   },
 };
 
-function xRequest<T = any>(token: string, url: string, opts: RequestOptions = {}) {
-  return request<T>(url, { ...opts, headers: { Authorization: `Bearer ${token}`, ...opts.headers } });
+/** Calls the X API with a current token (X tokens live 2 hours, video uploads can take a while). */
+function xRequest<T = any>(ctx: PublishContext, url: string, opts: RequestOptions = {}) {
+  return withFreshToken(ctx, (c: XCredentials) => c.accessToken, (token) =>
+    request<T>(url, { ...opts, headers: { Authorization: `Bearer ${token}`, ...opts.headers } }),
+  );
 }
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_GIF_BYTES = 15 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
 
 function mediaCategory(m: MediaFile): string {
   if (m.kind === "video") return "tweet_video";
   return m.mime === "image/gif" ? "tweet_gif" : "tweet_image";
 }
 
-async function uploadMedia(ctx: PublishContext, token: string, m: MediaFile, label: string): Promise<string> {
-  const init = await xRequest(token, `${API}/media/upload/initialize`, {
+async function uploadMedia(ctx: PublishContext, original: MediaFile, label: string): Promise<string> {
+  // X rejects photos over 5 MB; shrink them (GIFs keep their animation and are checked in validate()).
+  const m =
+    original.kind === "image" && original.mime !== "image/gif" && original.size > MAX_IMAGE_BYTES
+      ? await ctx.media.jpegVariant(original, { maxBytes: MAX_IMAGE_BYTES })
+      : original;
+  const init = await xRequest(ctx, `${API}/media/upload/initialize`, {
     method: "POST",
     json: { media_type: m.mime === "video/x-m4v" ? "video/mp4" : m.mime, total_bytes: m.size, media_category: mediaCategory(m) },
   });
@@ -119,10 +132,10 @@ async function uploadMedia(ctx: PublishContext, token: string, m: MediaFile, lab
     const form = new FormData();
     form.set("segment_index", String(i));
     form.set("media", new Blob([await readRange(m.path, start, end)], { type: "application/octet-stream" }), m.filename);
-    await xRequest(token, `${API}/media/upload/${id}/append`, { method: "POST", body: form, timeoutMs: 10 * 60_000 });
+    await xRequest(ctx, `${API}/media/upload/${id}/append`, { method: "POST", body: form, timeoutMs: 10 * 60_000 });
   }
 
-  const fin = await xRequest(token, `${API}/media/upload/${id}/finalize`, { method: "POST" });
+  const fin = await xRequest(ctx, `${API}/media/upload/${id}/finalize`, { method: "POST" });
   // Videos/GIFs are processed asynchronously; X tells us how long to wait between checks.
   let processing = fin.data?.data?.processing_info;
   const deadline = Date.now() + 15 * 60_000;
@@ -133,7 +146,7 @@ async function uploadMedia(ctx: PublishContext, token: string, m: MediaFile, lab
     if (Date.now() > deadline) throw new ApiError(`Timed out waiting for X to process ${label}`, 0, null, false);
     ctx.progress(`Waiting for X to process ${label}…`);
     await ctx.sleep(Math.max(1, Number(processing.check_after_secs ?? 2)) * 1000);
-    const s = await xRequest(token, `${API}/media/upload`, { query: { media_id: id, command: "STATUS" } });
+    const s = await xRequest(ctx, `${API}/media/upload`, { query: { media_id: id, command: "STATUS" } });
     processing = s.data?.data?.processing_info;
   }
   return id;
@@ -157,6 +170,15 @@ export const x: Platform = {
   validate(input) {
     const errors: string[] = [];
     if (input.media.some((m) => m.mime === "video/webm")) errors.push("X doesn't accept WebM videos; use MP4.");
+    for (const m of input.media) {
+      if (m.mime === "image/gif" && m.size > MAX_GIF_BYTES) errors.push(`X allows GIFs up to 15 MB; "${m.filename}" is bigger.`);
+      if (m.kind !== "video") continue;
+      if (m.size > MAX_VIDEO_BYTES) errors.push("X videos must be 512 MB or smaller.");
+      if (m.duration !== null && m.duration < 0.5) errors.push("X videos must be at least 0.5 seconds long.");
+      if (m.duration !== null && m.duration > 140 && input.options.premium !== true) {
+        errors.push("X videos can be at most 2:20 long unless the account has X Premium.");
+      }
+    }
     if (input.media.filter((m) => m.mime === "image/gif").length > 0 && input.media.length > 1) {
       errors.push("X only allows a GIF on its own.");
     }
@@ -164,19 +186,27 @@ export const x: Platform = {
   },
 
   async publish(ctx) {
-    const { accessToken: token } = (await ctx.credentials()) as XCredentials;
     const mediaIds: string[] = [];
     for (const [i, m] of ctx.input.media.entries()) {
       const label = ctx.input.media.length > 1 ? `item ${i + 1}` : m.kind === "video" ? "the video" : "the image";
-      mediaIds.push(await uploadMedia(ctx, token, m, label));
+      mediaIds.push(await uploadMedia(ctx, m, label));
     }
     ctx.progress("Posting to X…");
-    const res = await xRequest(token, `${API}/tweets`, {
-      method: "POST",
-      json: { text: ctx.input.text, ...(mediaIds.length ? { media: { media_ids: mediaIds } } : {}) },
-    });
+    // X has no idempotency key: if the outcome is unknown, don't let the queue post it again.
+    const res = await publishStep("X", () =>
+      xRequest(ctx, `${API}/tweets`, {
+        method: "POST",
+        json: { text: ctx.input.text, ...(mediaIds.length ? { media: { media_ids: mediaIds } } : {}) },
+      }),
+    );
     const id: string = res.data.data.id;
     const user = ctx.account.username;
     return { remoteId: id, url: user ? `https://x.com/${user}/status/${id}` : `https://x.com/i/web/status/${id}` };
+  },
+
+  async checkConnection(ctx) {
+    const { accessToken } = (await ctx.credentials()) as XCredentials;
+    const me = (await request(`${API}/users/me`, { headers: { Authorization: `Bearer ${accessToken}` } })).data.data;
+    return `Can post as @${me.username}.`;
   },
 };

@@ -1,22 +1,15 @@
+import twitterText from "twitter-text";
 import type { PlatformId } from "./platforms/types.js";
 
-const URL_RE = /https?:\/\/[^\s<>"]+/gi;
+export const URL_RE = /https?:\/\/[^\s<>"]+/gi;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const utf8 = new TextEncoder();
+// One whole emoji (incl. flags, skin tones, keycaps, ZWJ families). Built at runtime: the `v` flag needs ES2024 typings.
+const EMOJI = new RegExp("^\\p{RGI_Emoji}$", "v");
 
-/** X counts every link as 23 characters and most non-Latin characters / emoji as 2. */
+/** X's own counter (twitter-text): links count 23, emoji 2, CJK 2, text NFC-normalized. */
 export function xLength(text: string): number {
-  let n = 0;
-  const withoutUrls = text.replace(URL_RE, () => {
-    n += 23;
-    return "";
-  });
-  for (const ch of withoutUrls) {
-    const cp = ch.codePointAt(0)!;
-    const light =
-      cp <= 0x10ff || (cp >= 0x2000 && cp <= 0x200d) || (cp >= 0x2010 && cp <= 0x201f) || (cp >= 0x2032 && cp <= 0x2037);
-    n += light ? 1 : 2;
-  }
-  return n;
+  return twitterText.parseTweet(text).weightedLength;
 }
 
 export function graphemeLength(text: string): number {
@@ -25,9 +18,25 @@ export function graphemeLength(text: string): number {
   return n;
 }
 
+/** Threads counts each emoji as its UTF-8 byte length (usually 4 or more) toward the 500 limit. */
+export function threadsLength(text: string): number {
+  let n = 0;
+  for (const { segment } of segmenter.segment(text)) n += EMOJI.test(segment) ? utf8.encode(segment).length : [...segment].length;
+  return n;
+}
+
 /** Text length the way each platform counts it (close enough for validation). */
 export function measureText(platform: PlatformId, text: string): number {
-  if (platform === "x") return xLength(text);
-  if (platform === "bluesky") return graphemeLength(text);
-  return [...text].length;
+  switch (platform) {
+    case "x":
+      return xLength(text);
+    case "bluesky":
+      return graphemeLength(text);
+    case "threads":
+      return threadsLength(text);
+    case "tiktok":
+      return text.length; // TikTok counts UTF-16 units, so emoji count 2
+    default:
+      return [...text].length;
+  }
 }

@@ -24,6 +24,7 @@ post.
   click.
 - **Scheduling**: pick a date and time and the post goes out then.
 - **History** with live progress, errors in plain language, and "View" links to every published post.
+- **Test button per account** that checks the login works without posting anything.
 - **Handles the details**: refreshes short-lived tokens, converts images Instagram won't take (PNG/WebP → JPEG),
   compresses images for Bluesky, makes hashtags/links clickable on LinkedIn and Bluesky, picks a supported
   LinkedIn API version automatically.
@@ -77,12 +78,12 @@ Platforms send you back to `PUBLIC_BASE_URL` after you log in, most of them insi
 | --- | :-: | :-: | :-: | --- |
 | Facebook | ✓ | up to 10 | 1 (video or Reel) | Pages only; Meta doesn't allow apps to post to personal profiles |
 | Instagram | – | up to 10 (carousel) | Reels, or inside a carousel | Professional account linked to a Facebook Page |
-| TikTok | – | – | 1 | Private ("Only me") until TikTok audits your app, or send to inbox |
+| TikTok | – | – | 1 | Private ("Only me", private account) until TikTok audits your app, or send to inbox |
 | YouTube | – | – | 1 | Private until Google audits your API project; vertical ≤3 min become Shorts |
 | LinkedIn | ✓ | up to 20 | 1 (MP4) | Your profile; Company Pages need LinkedIn's approval |
 | Threads | ✓ | up to 20 | carousel | Media posts need a public `PUBLIC_BASE_URL` |
 | X | ✓ | up to 4 | 1 | The X API charges for posting |
-| Bluesky | ✓ | up to 4 | 1 (≤3 min) | Connect with an app password |
+| Bluesky | ✓ | up to 4 | 1 (≤10 min) | Connect with an app password |
 
 The audit and review steps are the platforms' rules for third-party apps, not something Post Sync can skip. For
 your own accounts, every platform lets you start in development or sandbox mode (see the setup guide).
@@ -139,9 +140,12 @@ Browser / script ──► Fastify server ──► SQLite (accounts, posts, que
 
 - Each post becomes one job per selected account. Jobs run in the background; the history page polls for
   progress.
-- Temporary errors (network, HTTP 5xx, rate limits) are retried after 1, 5 and 15 minutes (`MAX_ATTEMPTS`). Other
-  errors fail right away with the platform's message. Nothing is retried after the platform has accepted the
-  post, so you don't get duplicates.
+- Temporary errors (network, HTTP 5xx, rate limits) are retried after 1 and 5 minutes, or later if the platform
+  says when its rate limit resets (`MAX_ATTEMPTS`). Other errors fail right away with the platform's message.
+- **No duplicate posts:** if the request that publishes a post fails in a way that leaves the outcome unknown
+  (connection dropped, server error), Post Sync doesn't retry automatically. Where the platform lets us check
+  (Instagram, Threads, YouTube uploads), it checks whether the post went live; otherwise it asks you to check before
+  retrying. Long uploads resume where they stopped instead of starting a second copy.
 - If the server restarts in the middle of an upload, that job is marked failed (rather than silently re-posted),
   because the post may already be live. Check the platform, then click Retry if needed.
 - Expired or revoked logins mark the account "Reconnect" in the dashboard.

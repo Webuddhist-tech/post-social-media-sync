@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import type { Config } from "../src/config.js";
 import { hasFfmpeg } from "../src/media.js";
+import { clearBlueskySessions } from "../src/platforms/bluesky.js";
 import { facebook } from "../src/platforms/facebook.js";
 import { instagram } from "../src/platforms/instagram.js";
 import { threads } from "../src/platforms/threads.js";
@@ -25,7 +26,10 @@ describe("validation", () => {
 
   it("enforces per-platform rules", () => {
     expect(validateForPlatform(instagram, input(instagram, { text: "hi" }), config)).toEqual(["Instagram needs a photo or video."]);
-    expect(validateForPlatform(tiktokPlatform, input(tiktokPlatform, { text: "hi" }), config)).toEqual(["TikTok needs a video."]);
+    expect(validateForPlatform(tiktokPlatform, input(tiktokPlatform, { text: "hi" }), config)).toEqual([
+      "TikTok needs a video.",
+      "Choose who can view this TikTok post.",
+    ]);
     expect(
       validateForPlatform(youtube, input(youtube, { text: "hi", media: [fakeMedia(config, { kind: "image" })] }), config),
     ).toContain("YouTube doesn't support photo posts here, only video.");
@@ -64,6 +68,7 @@ describe("server", () => {
   let cookie: string;
 
   beforeEach(async () => {
+    clearBlueskySessions();
     config = testConfig();
     app = await buildApp({ config, dbFile: ":memory:", sleep: async () => {} });
     await app.ready();
@@ -199,7 +204,14 @@ describe("server", () => {
 
   it("retries temporary failures later, and lets the user retry permanent ones", async () => {
     const accountId = addBlueskyAccount();
-    mockFetch(blueskyRoutes(() => ({ status: 503, json: { error: "Unavailable", message: "try later" } })));
+    // The login fails with a server error: nothing was posted, so the queue retries by itself.
+    mockFetch([
+      {
+        method: "POST",
+        match: "https://bsky.social/xrpc/com.atproto.server.createSession",
+        reply: () => ({ status: 503, json: { error: "Unavailable", message: "try later" } }),
+      },
+    ]);
     const created = (await api("POST", "/posts", { text: "hi", targets: [{ accountId }] })).json().post;
     await app.services.worker.idle();
 
@@ -225,6 +237,33 @@ describe("server", () => {
     expect(target.status).toBe("succeeded");
   });
 
+  it("never auto-retries a post whose final request had an unknown outcome", async () => {
+    const accountId = addBlueskyAccount();
+    mockFetch(blueskyRoutes(() => ({ status: 502, json: { error: "BadGateway", message: "upstream" } })));
+    const created = (await api("POST", "/posts", { text: "hi", targets: [{ accountId }] })).json().post;
+    await app.services.worker.idle();
+    const target = (await api("GET", `/posts/${created.id}`)).json().post.targets[0];
+    expect(target.status).toBe("failed");
+    expect(target.error).toMatch(/Bluesky may have published this post.*Check Bluesky before retrying/);
+  });
+
+  it("waits as long as a rate limit asks before retrying", async () => {
+    const accountId = addBlueskyAccount();
+    mockFetch([
+      {
+        method: "POST",
+        match: "https://bsky.social/xrpc/com.atproto.server.createSession",
+        reply: () => ({ status: 429, json: { error: "RateLimitExceeded" }, headers: { "retry-after": "7200" } }),
+      },
+    ]);
+    const created = (await api("POST", "/posts", { text: "hi", targets: [{ accountId }] })).json().post;
+    await app.services.worker.idle();
+    const target = (await api("GET", `/posts/${created.id}`)).json().post.targets[0];
+    expect(target.status).toBe("queued");
+    expect(target.runAt).toBeGreaterThan(Date.now() + 7100_000);
+    expect(target.error).toMatch(/retrying in 2 h/);
+  });
+
   it("flags accounts whose login was rejected", async () => {
     const accountId = addBlueskyAccount();
     mockFetch([
@@ -240,6 +279,25 @@ describe("server", () => {
     expect(account.status).toBe("needs_reauth");
     const again = await api("POST", "/posts/validate", { text: "hi", targets: [{ accountId }] });
     expect(again.json().issues[0].errors[0]).toMatch(/Reconnect this account/);
+  });
+
+  it("tests an account's login without posting", async () => {
+    const accountId = addBlueskyAccount();
+    mockFetch(blueskyRoutes(() => ({ status: 500, json: {} })));
+    const ok = (await api("POST", `/accounts/${accountId}/check`)).json();
+    expect(ok).toEqual({ ok: true, detail: "Can post as @me.bsky.social." });
+
+    clearBlueskySessions();
+    mockFetch([
+      {
+        method: "POST",
+        match: "https://bsky.social/xrpc/com.atproto.server.createSession",
+        reply: () => ({ status: 401, json: { error: "AuthenticationRequired", message: "Invalid identifier or password" } }),
+      },
+    ]);
+    const bad = (await api("POST", `/accounts/${accountId}/check`)).json();
+    expect(bad).toMatchObject({ ok: false, needsReconnect: true });
+    expect((await api("GET", "/accounts")).json().accounts[0].status).toBe("needs_reauth");
   });
 
   it("holds scheduled posts until their time and allows cancelling", async () => {

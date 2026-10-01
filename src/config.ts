@@ -16,7 +16,7 @@ export interface Config {
   maxUploadBytes: number;
   workerConcurrency: number;
   maxAttempts: number;
-  meta: { appId: string; appSecret: string; graphVersion: string; loginConfigId: string | null };
+  meta: { appId: string; appSecret: string; graphVersion: string; loginConfigId: string | null; extraScopes: string[] };
   threads: { appId: string; appSecret: string };
   tiktok: { clientKey: string; clientSecret: string; scopes: string };
   linkedin: { clientId: string; clientSecret: string; version: string | null; organizations: boolean };
@@ -102,6 +102,11 @@ export function loadConfig(): Config {
       appSecret: env("META_APP_SECRET"),
       graphVersion: env("META_GRAPH_VERSION", "v26.0"),
       loginConfigId: env("META_LOGIN_CONFIG_ID") || null,
+      // e.g. "ads_read": Meta requires it to publish to Instagram when your Page role comes from Business Manager.
+      extraScopes: env("META_EXTRA_SCOPES")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     },
     threads: { appId: env("THREADS_APP_ID"), appSecret: env("THREADS_APP_SECRET") },
     tiktok: {
