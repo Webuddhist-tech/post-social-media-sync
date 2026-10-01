@@ -1,7 +1,7 @@
 import type { Config } from "./config.js";
 import { randomToken, type Secrets } from "./crypto.js";
 import type { AccountRow, DB } from "./db.js";
-import { AuthError } from "./http.js";
+import { ApiError, AuthError, RefreshError } from "./http.js";
 import { getConnector } from "./platforms/index.js";
 import type { AccountDraft, AccountInfo, ConnectorId } from "./platforms/types.js";
 
@@ -120,6 +120,8 @@ export class AccountService {
         return refreshed.credentials;
       } catch (err) {
         if (err instanceof AuthError) this.db.markAccountNeedsReauth(row.id, err.message);
+        // A refresh hiccup must never look like a failed publish request (see publishStep).
+        if (err instanceof ApiError && !(err instanceof RefreshError)) throw new RefreshError(err);
         throw err;
       } finally {
         this.refreshing.delete(accountId);

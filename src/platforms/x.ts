@@ -192,12 +192,11 @@ export const x: Platform = {
       mediaIds.push(await uploadMedia(ctx, m, label));
     }
     ctx.progress("Posting to X…");
-    // X has no idempotency key: if the outcome is unknown, don't let the queue post it again.
-    const res = await publishStep("X", () =>
-      xRequest(ctx, `${API}/tweets`, {
-        method: "POST",
-        json: { text: ctx.input.text, ...(mediaIds.length ? { media: { media_ids: mediaIds } } : {}) },
-      }),
+    // X has no idempotency key: if the tweet request's outcome is unknown, don't let the queue post it again.
+    // (Only that request: a failed token refresh before it is safe to retry.)
+    const body = { text: ctx.input.text, ...(mediaIds.length ? { media: { media_ids: mediaIds } } : {}) };
+    const res = await withFreshToken(ctx, (c: XCredentials) => c.accessToken, (token) =>
+      publishStep("X", () => request(`${API}/tweets`, { method: "POST", json: body, headers: { Authorization: `Bearer ${token}` } })),
     );
     const id: string = res.data.data.id;
     const user = ctx.account.username;

@@ -3,7 +3,7 @@
  * Instagram professional accounts linked to those Pages.
  */
 import type { Config } from "../config.js";
-import { ApiError, AuthError, request, UserError, type RequestOptions } from "../http.js";
+import { ApiError, AuthError, isUnknownOutcome, request, uncertainOutcome, UserError, type RequestOptions } from "../http.js";
 import type { AccountDraft, Connector } from "./types.js";
 
 export const META_SCOPES = [
@@ -19,14 +19,19 @@ export function graphUrl(config: Config, path: string, host = "graph.facebook.co
   return `https://${host}/${config.meta.graphVersion}/${path.replace(/^\//, "")}`;
 }
 
-/** Meta's temporary error codes: worth retrying later. */
-export function isTransientMetaError(e: any): boolean {
+/**
+ * How Meta's temporary errors should be treated:
+ * - "throttle": a rate limit or posting-speed block. Meta refused, nothing happened, retry later.
+ * - "unknown": a transient server problem (codes 1/2, is_transient). Meta may or may not have acted.
+ */
+export function metaErrorKind(e: any): "throttle" | "unknown" | null {
   const code = Number(e?.code);
-  if (e?.is_transient === true) return true;
-  // 1/2 = temporary, 4/17/32/341/613 = app/user rate limits, 80000-80014 = Business Use Case (per Page/IG account)
-  // rate limits, 368/1390008 = "posting too fast" block.
-  if ([1, 2, 4, 17, 32, 341, 613].includes(code) || (code >= 80000 && code <= 80014)) return true;
-  return code === 368 && Number(e?.error_subcode) === 1390008;
+  // 4/17/32/341/613 = app/user rate limits, 80000-80014 = Business Use Case (per Page/IG account) rate limits,
+  // 368/1390008 = "posting too fast" block.
+  if ([4, 17, 32, 341, 613].includes(code) || (code >= 80000 && code <= 80014)) return "throttle";
+  if (code === 368 && Number(e?.error_subcode) === 1390008) return "throttle";
+  if (code === 1 || code === 2 || e?.is_transient === true) return "unknown";
+  return null;
 }
 
 /** Graph API call with Meta's error codes mapped to retry/re-auth semantics. */
@@ -40,11 +45,14 @@ export async function graph<T = any>(url: string, opts: RequestOptions = {}, con
       if (code === 190 || code === 102) {
         throw new AuthError(`Meta says the access token is no longer valid (${e?.message ?? "code 190"}). Reconnect the account.`);
       }
-      if (isTransientMetaError(e) && !err.retryable) throw new ApiError(err.message, err.status, err.body, true);
-      // (#10) / (#200-299): the app or the person lacks a permission.
-      if (context.permissionHint && (code === 10 || (code >= 200 && code <= 299))) {
-        throw new UserError(`${err.message}. ${context.permissionHint}`);
-      }
+      const kind = metaErrorKind(e);
+      // Unknown-outcome errors are reported like a 5xx, whatever HTTP status Meta used, so publishing steps
+      // treat them as "may have happened" instead of retrying blindly.
+      if (kind === "unknown") throw new ApiError(err.message, err.status >= 500 ? err.status : 503, err.body, true);
+      if (kind === "throttle" && !err.retryable) throw new ApiError(err.message, err.status, err.body, true);
+      // (#10) / (#200-299) / "(#100) No permission to publish the video": the app or the person lacks a permission.
+      const permission = code === 10 || (code >= 200 && code <= 299) || (code === 100 && /no permission to publish/i.test(e?.message ?? ""));
+      if (context.permissionHint && permission) throw new UserError(`${err.message}. ${context.permissionHint}`);
     }
     throw err;
   }
@@ -164,3 +172,39 @@ export const metaConnector: Connector = {
     return drafts;
   },
 };
+
+/**
+ * Publishes a Meta container (Instagram media / Threads post) without ever publishing twice.
+ * If the publish request's outcome is unknown, re-reads the container a few times: PUBLISHED means it went live;
+ * a container that stays FINISHED was not published, so we publish the *same* container again (Meta refuses to
+ * publish a container twice, which makes this safe). Anything else is reported as "check before retrying".
+ */
+export async function publishContainerOnce(opts: {
+  platformName: string;
+  sleep: (ms: number) => Promise<void>;
+  publish: () => Promise<{ id: string }>;
+  status: () => Promise<string | null>;
+}): Promise<{ id: string } | { publishedContainer: true }> {
+  let firstError: ApiError | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await opts.publish();
+    } catch (err) {
+      // A clear refusal on the first try (bad media, permissions, rate limit) is handled by the normal rules.
+      if (attempt === 1 && !isUnknownOutcome(err)) throw err;
+      if (err instanceof ApiError) firstError ??= err;
+      let status: string | null = null;
+      for (let check = 1; check <= 3; check++) {
+        await opts.sleep(check * 10_000);
+        status = await opts.status().catch(() => null);
+        if (status === "PUBLISHED") return { publishedContainer: true };
+        if (status !== "FINISHED") break;
+      }
+      // Still FINISHED after ~1 minute means it wasn't published: try the same container once more.
+      if (attempt === 1 && status === "FINISHED") continue;
+      if (firstError) throw uncertainOutcome(opts.platformName, firstError);
+      throw err;
+    }
+  }
+  throw new Error("unreachable");
+}

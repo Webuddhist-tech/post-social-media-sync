@@ -1,4 +1,4 @@
-import { publishStep } from "../http.js";
+import { ApiError, publishStep, uncertainOutcome } from "../http.js";
 import { fileBlob, type MediaFile } from "../media.js";
 import { pollUntil } from "./common.js";
 import { graph, graphUrl } from "./meta.js";
@@ -105,26 +105,32 @@ async function publishReel(ctx: PublishContext, pageId: string, token: string, v
   );
 
   ctx.progress("Waiting for Facebook to process the reel…");
-  await pollUntil(
-    ctx.sleep,
-    async () => {
-      const res = await graph(graphUrl(ctx.config, start.video_id), { query: { fields: "status", access_token: token } });
-      const status = res.status ?? {};
-      const phases = [status.uploading_phase, status.processing_phase, status.publishing_phase];
-      const failedPhase = phases.find((p) => p?.status === "error");
-      if (["error", "expired", "upload_failed"].includes(status.video_status) || failedPhase) {
-        const why = failedPhase?.errors?.[0]?.message ?? status.video_status ?? "processing failed";
-        throw new Error(`Facebook couldn't process the reel: ${why}`);
-      }
-      const published =
-        ["complete", "completed"].includes(status.publishing_phase?.status) ||
-        status.publishing_phase?.publish_status === "published" ||
-        status.video_status === "ready";
-      return published ? true : null;
-    },
-    // The reel is already submitted for publishing: ride out temporary errors instead of starting over.
-    { intervalMs: 5000, maxIntervalMs: 60_000, timeoutMs: 20 * 60_000, what: "Facebook to process the reel", tolerateTransientErrors: true },
-  );
+  try {
+    await pollUntil(
+      ctx.sleep,
+      async () => {
+        const res = await graph(graphUrl(ctx.config, start.video_id), { query: { fields: "status", access_token: token } });
+        const status = res.status ?? {};
+        const phases = [status.uploading_phase, status.processing_phase, status.publishing_phase];
+        const failedPhase = phases.find((p) => p?.status === "error");
+        if (["error", "expired", "upload_failed"].includes(status.video_status) || failedPhase) {
+          const why = failedPhase?.errors?.[0]?.message ?? status.video_status ?? "processing failed";
+          throw new Error(`Facebook couldn't process the reel: ${why}`);
+        }
+        const published =
+          ["complete", "completed"].includes(status.publishing_phase?.status) ||
+          status.publishing_phase?.publish_status === "published" ||
+          status.video_status === "ready";
+        return published ? true : null;
+      },
+      // The reel is already submitted for publishing: ride out temporary errors instead of starting over.
+      { intervalMs: 5000, maxIntervalMs: 60_000, timeoutMs: 20 * 60_000, what: "Facebook to process the reel", tolerateTransientErrors: true },
+    );
+  } catch (err) {
+    // Starting over would publish the reel a second time.
+    if (err instanceof ApiError && err.retryable) throw uncertainOutcome("Facebook", err);
+    throw err;
+  }
   return { remoteId: start.video_id, url: `https://www.facebook.com/reel/${start.video_id}` };
 }
 

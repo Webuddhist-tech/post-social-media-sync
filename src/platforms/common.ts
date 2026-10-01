@@ -12,6 +12,8 @@ export interface PollOptions {
    * already has the post: failing here would make the queue start over and publish it twice.
    */
   tolerateTransientErrors?: boolean;
+  /** Let the queue retry after a timeout. Only for waits that happen before anything is published. */
+  retryableTimeout?: boolean;
 }
 
 /** Polls `check` until it returns a value, or throws after `timeoutMs`. */
@@ -30,7 +32,7 @@ export async function pollUntil<T>(sleep: (ms: number) => Promise<void>, check: 
     }
     if (result !== null) return result;
     if (Date.now() > deadline) {
-      throw new ApiError(`Timed out after ${Math.round(opts.timeoutMs / 60000)} min waiting for ${opts.what}`, 0, null, false);
+      throw new ApiError(`Timed out after ${Math.round(opts.timeoutMs / 60000)} min waiting for ${opts.what}`, 0, null, !!opts.retryableTimeout);
     }
     await sleep(interval);
     interval = Math.min(interval * 1.5, opts.maxIntervalMs ?? 30_000);

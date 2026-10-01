@@ -283,7 +283,10 @@ describe("server", () => {
 
   it("tests an account's login without posting", async () => {
     const accountId = addBlueskyAccount();
-    mockFetch(blueskyRoutes(() => ({ status: 500, json: {} })));
+    mockFetch([
+      ...blueskyRoutes(() => ({ status: 500, json: {} })),
+      { method: "GET", match: "https://bsky.social/xrpc/com.atproto.server.getSession", reply: () => ({ json: { handle: "me.bsky.social", active: true } }) },
+    ]);
     const ok = (await api("POST", `/accounts/${accountId}/check`)).json();
     expect(ok).toEqual({ ok: true, detail: "Can post as @me.bsky.social." });
 
@@ -298,6 +301,22 @@ describe("server", () => {
     const bad = (await api("POST", `/accounts/${accountId}/check`)).json();
     expect(bad).toMatchObject({ ok: false, needsReconnect: true });
     expect((await api("GET", "/accounts")).json().accounts[0].status).toBe("needs_reauth");
+  });
+
+  it("retries later when refreshing a login fails temporarily (nothing was posted)", async () => {
+    const [accountId] = app.services.accounts.saveDrafts("x", [
+      { platform: "x", externalId: "42", name: "Me", username: "me", credentials: { accessToken: "OLD", refreshToken: "R1" }, expiresAt: Date.now() - 1000 },
+    ]);
+    const { calls } = mockFetch([
+      { method: "POST", match: "https://api.x.com/2/oauth2/token", reply: () => ({ status: 503, json: { title: "Service Unavailable", detail: "busy" } }) },
+    ]);
+    const post = (await api("POST", "/posts", { text: "later", targets: [{ accountId }] })).json().post;
+    await app.services.worker.idle();
+    const target = (await api("GET", `/posts/${post.id}`)).json().post.targets[0];
+    expect(target.status).toBe("queued");
+    expect(target.error).toMatch(/Couldn't refresh the login/);
+    expect(calls.some((c) => c.url.pathname === "/2/tweets")).toBe(false);
+    expect((await api("GET", "/accounts")).json().accounts[0].status).toBe("active");
   });
 
   it("holds scheduled posts until their time and allows cancelling", async () => {

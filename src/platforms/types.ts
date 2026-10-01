@@ -30,6 +30,8 @@ export interface OptionField {
   choices?: Array<{ value: string; label: string }>;
   default?: string | boolean;
   help?: string;
+  /** false = the dashboard must not remember this choice for the next post (e.g. TikTok privacy). */
+  remember?: boolean;
 }
 
 /** Everything a platform needs to publish one post to one account. */

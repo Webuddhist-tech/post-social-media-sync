@@ -131,7 +131,7 @@ export function tagsLength(tags: string[]): number {
 function googleError(err: unknown): unknown {
   if (!(err instanceof ApiError)) return err;
   const reason = (err.body as any)?.error?.errors?.[0]?.reason;
-  if (["rateLimitExceeded", "userRateLimitExceeded"].includes(reason)) {
+  if (["rateLimitExceeded", "userRateLimitExceeded", "uploadRateLimitExceeded"].includes(reason)) {
     return new ApiError(err.message, err.status, err.body, true, err);
   }
   if (reason === "quotaExceeded") {
@@ -165,6 +165,9 @@ async function uploadFile(ctx: PublishContext, uploadUrl: string): Promise<any> 
   let failures = 0;
   let stalls = 0;
   let refreshed = false;
+  // A resumable upload only becomes a video once YouTube has the last byte. Until a request carrying it has been
+  // sent, a failure can't have created anything, so it's safe for the queue to retry with a new session.
+  let finalSent = false;
   for (;;) {
     let res: HttpResponse;
     const probing = needProbe || offset >= video.size;
@@ -174,6 +177,7 @@ async function uploadFile(ctx: PublishContext, uploadUrl: string): Promise<any> 
       } else {
         const end = Math.min(offset + CHUNK, video.size) - 1;
         ctx.progress(`Uploading to YouTube (${Math.round(((end + 1) / video.size) * 100)}%)…`);
+        if (end === video.size - 1) finalSent = true;
         res = await request(uploadUrl, {
           method: "PUT",
           headers: {
@@ -187,21 +191,21 @@ async function uploadFile(ctx: PublishContext, uploadUrl: string): Promise<any> 
         });
       }
       needProbe = false;
-      failures = 0;
-      refreshed = false;
-    } catch (err) {
-      if (err instanceof AuthError && !refreshed) {
+    } catch (raw) {
+      if (raw instanceof AuthError && !refreshed) {
         refreshed = true; // the token expired mid-upload: refresh once and pick up where we left off
         await token(true);
         needProbe = true;
         continue;
       }
-      if (probing && err instanceof ApiError && (err.status === 404 || err.status === 410)) {
-        throw new ApiError("The YouTube upload session expired before the upload finished.", err.status, err.body, true);
+      if (probing && raw instanceof ApiError && (raw.status === 404 || raw.status === 410)) {
+        throw new ApiError("The YouTube upload session expired before the upload finished.", raw.status, raw.body, true);
       }
-      if (!(err instanceof ApiError) || !err.retryable) throw googleError(err);
-      if (++failures > 5) throw uncertainOutcome("YouTube", err); // the last chunk may have gone through
-      await ctx.sleep(Math.min(60_000, 5000 * 2 ** (failures - 1)));
+      const err = googleError(raw); // e.g. 403 rateLimitExceeded becomes retryable
+      if (!(err instanceof ApiError) || !err.retryable) throw err;
+      if (++failures > 5) throw finalSent ? uncertainOutcome("YouTube", err) : err;
+      const backoff = Math.min(60_000, 5000 * 2 ** (failures - 1));
+      await ctx.sleep(Math.min(5 * 60_000, Math.max(backoff, err.retryAfterMs ?? 0)));
       needProbe = true;
       continue;
     }
@@ -210,8 +214,13 @@ async function uploadFile(ctx: PublishContext, uploadUrl: string): Promise<any> 
     // "Range: bytes=0-N" says what YouTube has stored; no header means nothing yet.
     const range = res.headers.get("range");
     const next = range ? Number(range.split("-")[1]) + 1 : 0;
-    const noProgress = probing ? offset >= video.size && next >= video.size : next <= offset;
-    if (noProgress && ++stalls > 3) throw new ApiError("The YouTube upload isn't making progress.", 308, null, true);
+    finalSent = false; // a 308 means YouTube doesn't have the whole file yet
+    if (next > offset) {
+      failures = 0; // only real progress earns a fresh error budget
+      refreshed = false;
+    } else if ((!probing || offset >= video.size) && ++stalls > 3) {
+      throw new ApiError("The YouTube upload isn't making progress.", 308, null, true);
+    }
     offset = next;
   }
 }

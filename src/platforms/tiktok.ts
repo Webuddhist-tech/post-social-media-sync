@@ -1,6 +1,6 @@
-import { ApiError, AuthError, request, uncertainOutcome, UserError, type RequestOptions } from "../http.js";
+import { ApiError, AuthError, isUnknownOutcome, request, UserError, type RequestOptions } from "../http.js";
 import { readRange, type MediaFile } from "../media.js";
-import { pollUntil } from "./common.js";
+import { pollUntil, withFreshToken } from "./common.js";
 import type { Connector, Platform, PublishContext } from "./types.js";
 
 const API = "https://open.tiktokapis.com/v2";
@@ -42,6 +42,7 @@ async function tiktokCall(url: string, token: string, opts: RequestOptions = {})
     throw err;
   }
   const error = res.data?.error;
+  if (error?.code === "access_token_invalid") throw new AuthError("TikTok rejected the token (access_token_invalid). Reconnect the account.");
   if (error && error.code && error.code !== "ok") {
     const hint = HINTS[error.code];
     throw new ApiError(`${hint ?? error.message ?? "TikTok error"} (${error.code})`, res.status, res.data, error.code === "rate_limit_exceeded");
@@ -182,8 +183,12 @@ export function tiktokChunks(size: number): { chunkSize: number; count: number; 
   return { chunkSize, count, ranges };
 }
 
-/** Uploads the chunks in order, retrying a chunk in place on temporary errors. */
-async function uploadChunks(ctx: PublishContext, uploadUrl: string, video: MediaFile) {
+/**
+ * Uploads the chunks in order, retrying a chunk in place on temporary errors. Returns "unknown" if the final
+ * chunk's response was lost (TikTok may have the whole video and publish it); any other failure is thrown and is
+ * safe to retry from scratch, because TikTok never publishes an incomplete upload.
+ */
+async function uploadChunks(ctx: PublishContext, uploadUrl: string, video: MediaFile): Promise<"done" | "unknown"> {
   const { ranges } = tiktokChunks(video.size);
   const mime = video.mime === "video/x-m4v" ? "video/mp4" : video.mime;
   for (const [i, [start, end]] of ranges.entries()) {
@@ -203,18 +208,17 @@ async function uploadChunks(ctx: PublishContext, uploadUrl: string, video: Media
         });
         break;
       } catch (err) {
-        const last = i === ranges.length - 1;
         if (!(err instanceof ApiError) || !err.retryable) throw err;
         if (attempt < 3) {
-          await ctx.sleep(attempt * 5000);
+          await ctx.sleep(Math.max(attempt * 5000, err.retryAfterMs ?? 0));
           continue;
         }
-        // TikTok may have received the final chunk even though we didn't hear back: check the status instead.
-        if (last) return;
+        if (i === ranges.length - 1 && isUnknownOutcome(err)) return "unknown";
         throw err;
       }
     }
   }
+  return "done";
 }
 
 export const tiktokPlatform: Platform = {
@@ -251,15 +255,16 @@ export const tiktokPlatform: Platform = {
         { value: "FOLLOWER_OF_CREATOR", label: "Followers" },
         { value: "SELF_ONLY", label: "Only me" },
       ],
-      // No default on purpose: TikTok requires creators to choose (Content Sharing Guidelines).
+      // No default (and not remembered) on purpose: TikTok requires creators to choose each time.
+      remember: false,
       help: "Until TikTok audits your app: use \"Only me\" and set your TikTok account to Private (max. 5 accounts per day).",
     },
-    { key: "allowComments", label: "Allow comments", type: "checkbox", default: false },
-    { key: "allowDuet", label: "Allow Duet", type: "checkbox", default: false },
-    { key: "allowStitch", label: "Allow Stitch", type: "checkbox", default: false },
-    { key: "brandOrganic", label: "Promotes my own brand", type: "checkbox", default: false },
-    { key: "brandContent", label: "Paid partnership / branded content", type: "checkbox", default: false },
-    { key: "aiGenerated", label: "AI-generated content", type: "checkbox", default: false },
+    { key: "allowComments", label: "Allow comments", type: "checkbox", default: false, remember: false },
+    { key: "allowDuet", label: "Allow Duet", type: "checkbox", default: false, remember: false },
+    { key: "allowStitch", label: "Allow Stitch", type: "checkbox", default: false, remember: false },
+    { key: "brandOrganic", label: "Promotes my own brand", type: "checkbox", default: false, remember: false },
+    { key: "brandContent", label: "Paid partnership / branded content", type: "checkbox", default: false, remember: false },
+    { key: "aiGenerated", label: "AI-generated content", type: "checkbox", default: false, remember: false },
   ],
 
   validate(input) {
@@ -318,19 +323,20 @@ export const tiktokPlatform: Platform = {
       init = await tiktok(`${API}/post/publish/inbox/video/init/`, token, { method: "POST", json: { source_info: sourceInfo } });
     }
 
+    // Until the last chunk is in, failures are safe to retry from scratch (handled by the worker).
+    const upload = await uploadChunks(ctx, init.upload_url, video);
+
     // From here on TikTok has (or may have) the whole video and publishes it by itself. Starting over would
     // post it twice, so temporary errors are ridden out and anything else is reported as "check TikTok".
     let final: { status: any; postId: string | null };
     try {
-      await uploadChunks(ctx, init.upload_url, video);
       ctx.progress("Waiting for TikTok to process the video…");
       final = await pollUntil(
         ctx.sleep,
         async () => {
-          const { data: s, text } = await tiktokCall(`${API}/post/publish/status/fetch/`, token, {
-            method: "POST",
-            json: { publish_id: init.publish_id },
-          });
+          const { data: s, text } = await withFreshToken(ctx, (c: TikTokCredentials) => c.accessToken, (t) =>
+            tiktokCall(`${API}/post/publish/status/fetch/`, t, { method: "POST", json: { publish_id: init.publish_id } }),
+          );
           if (s.status === "FAILED") throw new UserError(`TikTok rejected the video: ${s.fail_reason ?? "unknown reason"}`);
           if (s.status === "PUBLISH_COMPLETE" || (mode === "inbox" && s.status === "SEND_TO_USER_INBOX")) {
             return { status: s, postId: publicPostId(text) };
@@ -340,9 +346,15 @@ export const tiktokPlatform: Platform = {
         { intervalMs: 5000, maxIntervalMs: 30_000, timeoutMs: 30 * 60_000, what: "TikTok to process the video", tolerateTransientErrors: true },
       );
     } catch (err) {
-      // Once the upload is underway, even a rate limit means "TikTok may still publish it": never start over.
-      if (err instanceof ApiError && err.retryable) throw uncertainOutcome("TikTok", err);
-      throw err;
+      if (err instanceof UserError) throw err; // TikTok explicitly rejected it: nothing was posted
+      const why = err instanceof Error ? err.message : String(err);
+      const lost = upload === "unknown" ? " (the upload's last response was lost)" : "";
+      throw new ApiError(
+        `Couldn't confirm the TikTok post${lost}: ${why}. TikTok may still publish it, so check TikTok before retrying.`,
+        err instanceof ApiError ? err.status : 0,
+        err instanceof ApiError ? err.body : null,
+        false,
+      );
     }
 
     if (mode === "inbox") {

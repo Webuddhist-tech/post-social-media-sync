@@ -1,7 +1,7 @@
-import { isUnknownOutcome, uncertainOutcome, UserError } from "../http.js";
+import { UserError } from "../http.js";
 import { fileBlob, type MediaFile } from "../media.js";
 import { pollUntil } from "./common.js";
-import { graph, graphUrl } from "./meta.js";
+import { graph, graphUrl, publishContainerOnce } from "./meta.js";
 import type { Platform, PublishContext } from "./types.js";
 
 interface InstagramCredentials {
@@ -193,23 +193,29 @@ export const instagram: Platform = {
     await waitForContainers(ctx, [containerId], token, what);
 
     ctx.progress("Publishing on Instagram…");
-    let published: { id: string };
-    try {
-      published = await graph<{ id: string }>(
-        graphUrl(ctx.config, `${igId}/media_publish`),
-        { method: "POST", form: { creation_id: containerId, access_token: token } },
-        { permissionHint: PERMISSION_HINT },
-      );
-    } catch (err) {
-      if (!isUnknownOutcome(err)) throw err;
-      // The response was lost or Meta hiccupped: Instagram may have published anyway. Never publish twice.
-      const status = await containerStatus(ctx, containerId, token);
-      if (status === "PUBLISHED") {
-        return { remoteId: containerId, url: null, note: "Published, but Instagram didn't confirm it in time, so there's no direct link." };
+    const outcome = await publishContainerOnce({
+      platformName: "Instagram",
+      sleep: ctx.sleep,
+      publish: () =>
+        graph<{ id: string }>(
+          graphUrl(ctx.config, `${igId}/media_publish`),
+          { method: "POST", form: { creation_id: containerId, access_token: token } },
+          { permissionHint: PERMISSION_HINT },
+        ),
+      status: () => containerStatus(ctx, containerId, token),
+    });
+    if ("publishedContainer" in outcome) {
+      // It went live but we never got the media id: look up the newest post (best effort, for the link).
+      try {
+        const recent = await graph(graphUrl(ctx.config, `${igId}/media`), { query: { fields: "id,permalink,timestamp", limit: 1, access_token: token } });
+        const latest = recent.data?.[0];
+        if (latest && Date.now() - Date.parse(latest.timestamp) < 15 * 60_000) return { remoteId: latest.id, url: latest.permalink ?? null };
+      } catch {
+        // fall through
       }
-      if (status === "FINISHED") throw err; // definitely not published: a retry is safe
-      throw uncertainOutcome("Instagram", err);
+      return { remoteId: containerId, url: null, note: "Published, but Instagram didn't confirm it in time, so there's no direct link." };
     }
+    const published = outcome;
 
     let url: string | null = null;
     try {

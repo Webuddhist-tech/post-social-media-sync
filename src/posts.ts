@@ -31,6 +31,8 @@ export interface TargetIssue {
   accountName: string;
   platform: string;
   errors: string[];
+  /** Caption length as the platform counts it (the dashboard shows it for X, whose rules are complex). */
+  length: number;
 }
 
 /** Fills in option defaults so the publisher always sees a complete set. */
@@ -136,6 +138,7 @@ export class PostService {
       accountId: account.id,
       accountName: account.name,
       platform: account.platform,
+      length: measureText(platform.id, input.text),
       errors: [
         ...(account.status === "needs_reauth" ? [`Reconnect this account first: ${account.status_message ?? "login expired"}`] : []),
         ...validateForPlatform(platform, input, this.config),

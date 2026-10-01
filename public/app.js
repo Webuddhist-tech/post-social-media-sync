@@ -219,6 +219,7 @@ window.addEventListener("hashchange", route);
 async function boot() {
   const [meta, { accounts }] = await Promise.all([api("/meta"), api("/accounts")]);
   state.meta = meta;
+  state.options = forgetOneOffOptions(state.options);
   state.accounts = accounts;
   // Forget selections for accounts that no longer exist.
   state.selected = new Set([...state.selected].filter((id) => accounts.some((a) => a.id === id && a.status === "active")));
@@ -240,6 +241,20 @@ function selectedPlatforms() {
   const order = state.meta.platforms.map((p) => p.id);
   return [...new Set(selectedAccounts().map((a) => a.platform))].sort((a, b) => order.indexOf(a) - order.indexOf(b));
 }
+/** Platform options that must not carry over to the next post (e.g. TikTok privacy, per TikTok's rules). */
+function forgetOneOffOptions(options) {
+  const out = {};
+  for (const [platform, values] of Object.entries(options ?? {})) {
+    const fields = platformInfo(platform)?.options ?? [];
+    out[platform] = Object.fromEntries(Object.entries(values).filter(([k]) => fields.find((f) => f.key === k)?.remember !== false));
+  }
+  return out;
+}
+
+function saveOptions() {
+  saveJSON("options", forgetOneOffOptions(state.options));
+}
+
 function optionValue(platform, field) {
   const v = state.options[platform]?.[field.key];
   return v === undefined ? field.default : v;
@@ -353,7 +368,7 @@ function renderPlatformDependent() {
 function optionField(platform, f) {
   const set = (value) => {
     state.options[platform] = { ...state.options[platform], [f.key]: value };
-    saveJSON("options", state.options);
+    saveOptions();
     renderCounters();
     scheduleValidate();
   };
@@ -375,6 +390,8 @@ function optionField(platform, f) {
   return h("label", { class: "field" }, h("span", {}, f.label), input);
 }
 
+const lengthKey = () => JSON.stringify([$("#text").value, state.overrides]);
+
 function renderCounters() {
   const text = $("#text").value;
   const box = $("#counters");
@@ -383,7 +400,8 @@ function renderCounters() {
     const p = platformInfo(id);
     const own = state.overrides[id]?.trim() ? state.overrides[id] : text;
     const max = id === "x" && optionValue("x", { key: "premium", default: false }) ? 25000 : p.capabilities.maxTextLength;
-    const n = measure(id, own.trim());
+    const server = state.serverLengths?.key === lengthKey() ? state.serverLengths.byPlatform[id] : undefined;
+    const n = typeof server === "number" ? server : measure(id, own.trim());
     box.append(h("span", { class: `counter${n > max ? " over" : ""}` }, `${p.name} ${n.toLocaleString()}/${max.toLocaleString()}`));
   }
 }
@@ -444,9 +462,13 @@ async function validate() {
     renderIssues();
     return;
   }
+  const key = lengthKey();
   try {
     const { issues } = await api("/posts/validate", { method: "POST", body: req });
     state.issues = issues.filter((i) => i.errors.length);
+    // The server counts exactly like each platform (X's rules are complex); prefer its numbers while still current.
+    state.serverLengths = { key, byPlatform: Object.fromEntries(issues.map((i) => [i.platform, i.length])) };
+    renderCounters();
   } catch (err) {
     state.issues = [{ accountName: "Check failed", platform: "", errors: [err.message] }];
   }
@@ -495,6 +517,7 @@ $("#publish").addEventListener("click", async () => {
     $("#title").value = "";
     state.media = [];
     state.overrides = {};
+    state.options = forgetOneOffOptions(state.options);
     $('input[name="when"][value="now"]').checked = true;
     $("#scheduled-at").hidden = true;
     $("#scheduled-at").value = "";

@@ -48,11 +48,12 @@ const sessions = new Map<string, { session: Session; refreshJwt: string; at: num
 const sessionKey = (c: BlueskyCredentials) =>
   `${c.service}|${c.identifier}|${crypto.createHash("sha256").update(c.appPassword).digest("hex").slice(0, 16)}`;
 
-async function getSession(c: BlueskyCredentials): Promise<Session> {
+async function getSession(c: BlueskyCredentials, opts: { verify?: boolean } = {}): Promise<Session> {
   if (!c.identifier || !c.appPassword || !c.service) throw new AuthError("The saved Bluesky login is incomplete. Reconnect the account.");
   const key = sessionKey(c);
   const cached = sessions.get(key);
-  if (cached && Date.now() - cached.at < 60 * 60_000) return cached.session;
+  // `verify` always talks to the server (refreshSession fails once the app password is revoked).
+  if (cached && !opts.verify && Date.now() - cached.at < 60 * 60_000) return cached.session;
   if (cached) {
     try {
       const res = await request(`${cached.session.pds}/xrpc/com.atproto.server.refreshSession`, {
@@ -274,8 +275,10 @@ export const bluesky: Platform = {
   },
 
   async checkConnection(ctx) {
-    const s = await getSession((await ctx.credentials()) as BlueskyCredentials);
-    return `Can post as @${s.handle}.`;
+    const s = await getSession((await ctx.credentials()) as BlueskyCredentials, { verify: true });
+    const info = (await request(xrpc(s, "com.atproto.server.getSession"), { headers: auth(s) })).data;
+    if (info.active === false) throw new UserError(`The Bluesky account is ${info.status ?? "inactive"}.`);
+    return `Can post as @${info.handle ?? s.handle}.`;
   },
 };
 

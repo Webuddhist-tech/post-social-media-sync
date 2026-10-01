@@ -15,7 +15,7 @@ import { x } from "../src/platforms/x.js";
 import { googleConnector, parseTags, tagsLength, youtube, youtubeTitle } from "../src/platforms/youtube.js";
 import { validateForPlatform, withDefaults } from "../src/posts.js";
 import { measureText } from "../src/text.js";
-import { fakeMedia, makeCtx, mockFetch, testConfig } from "./helpers.js";
+import { fakeMedia, form, makeCtx, mockFetch, testConfig } from "./helpers.js";
 
 const G = "https://graph.facebook.com/v26.0";
 const config = testConfig();
@@ -214,26 +214,65 @@ describe("Instagram", () => {
     expect(calls.filter((c) => c.url.pathname.endsWith("media_publish"))).toHaveLength(1);
   });
 
-  it("only allows a retry when the container is certainly unpublished", async () => {
-    const run = async (status: string) => {
-      mockFetch([
-        { method: "POST", match: `${G}/ig-1/media_publish`, reply: () => ({ status: 503, json: {} }) },
-        { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: "c1" } }) },
-        statuses("FINISHED"),
-        { method: "GET", match: `${G}/c1`, reply: () => ({ json: { status_code: status } }) },
-      ]);
-      const ctx = makeCtx(instagram, {
-        config,
-        account: { externalId: "ig-1" },
-        credentials: { accessToken: "T" },
-        input: { text: "x", media: [fakeMedia(config, { kind: "image" })] },
-      });
-      return instagram.publish(ctx).catch((e) => e);
-    };
-    expect((await run("FINISHED")).retryable).toBe(true);
-    const unknown = await run("IN_PROGRESS");
-    expect(unknown.retryable).toBe(false);
-    expect(unknown.message).toMatch(/may have published/);
+  it("re-publishes the same container when a lost response turns out not to have published (th-new-1)", async () => {
+    const { calls } = mockFetch([
+      { method: "POST", match: `${G}/ig-1/media_publish`, reply: (_c, n) => (n === 1 ? { status: 503, json: {} } : { json: { id: "media-1" } }) },
+      { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: "c1" } }) },
+      statuses("FINISHED"),
+      { method: "GET", match: `${G}/c1`, reply: () => ({ json: { status_code: "FINISHED" } }) },
+      { method: "GET", match: `${G}/media-1`, reply: () => ({ json: { permalink: "https://instagram.com/p/1" } }) },
+    ]);
+    const ctx = makeCtx(instagram, {
+      config,
+      account: { externalId: "ig-1" },
+      credentials: { accessToken: "T" },
+      input: { text: "x", media: [fakeMedia(config, { kind: "image" })] },
+    });
+    const res = await instagram.publish(ctx);
+    expect(res.remoteId).toBe("media-1");
+    const publishes = calls.filter((c) => c.url.pathname.endsWith("media_publish")).map((c) => form(c).creation_id);
+    expect(publishes).toEqual(["c1", "c1"]); // same container, never a new one
+    expect(calls.filter((c) => c.method === "POST" && c.url.pathname.endsWith("/ig-1/media"))).toHaveLength(1);
+  });
+
+  it("reports 'check before retrying' when it can't tell", async () => {
+    mockFetch([
+      { method: "POST", match: `${G}/ig-1/media_publish`, reply: () => ({ status: 503, json: {} }) },
+      { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: "c1" } }) },
+      statuses("FINISHED"),
+      { method: "GET", match: `${G}/c1`, reply: () => ({ json: { status_code: "IN_PROGRESS" } }) },
+    ]);
+    const ctx = makeCtx(instagram, {
+      config,
+      account: { externalId: "ig-1" },
+      credentials: { accessToken: "T" },
+      input: { text: "x", media: [fakeMedia(config, { kind: "image" })] },
+    });
+    const err = await instagram.publish(ctx).catch((e) => e);
+    expect(err.retryable).toBe(false);
+    expect(err.message).toMatch(/may have published/);
+  });
+
+  it("treats Meta's 'unknown error' codes as unknown outcomes even with a 4xx status (IG-N1)", async () => {
+    const { calls } = mockFetch([
+      {
+        method: "POST",
+        match: `${G}/ig-1/media_publish`,
+        reply: () => ({ status: 400, json: { error: { message: "An unknown error occurred", code: 1, is_transient: true } } }),
+      },
+      { method: "POST", match: `${G}/ig-1/media`, reply: () => ({ json: { id: "c1" } }) },
+      statuses("FINISHED"),
+      { method: "GET", match: `${G}/c1`, reply: () => ({ json: { status_code: "PUBLISHED" } }) },
+      { method: "GET", match: `${G}/ig-1/media`, reply: () => ({ json: { data: [{ id: "m9", permalink: "https://instagram.com/p/9", timestamp: new Date().toISOString() }] } }) },
+    ]);
+    const ctx = makeCtx(instagram, {
+      config,
+      account: { externalId: "ig-1" },
+      credentials: { accessToken: "T" },
+      input: { text: "x", media: [fakeMedia(config, { kind: "image" })] },
+    });
+    expect(await instagram.publish(ctx)).toEqual({ remoteId: "m9", url: "https://instagram.com/p/9" });
+    expect(calls.filter((c) => c.url.pathname.endsWith("media_publish"))).toHaveLength(1);
   });
 
   it("validates video limits and mentions (ig-3, ig-7)", () => {

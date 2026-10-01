@@ -1,5 +1,5 @@
 import type { Config } from "../config.js";
-import { ApiError, publishStep, request, type HttpResponse, type RequestOptions } from "../http.js";
+import { ApiError, publishStep, request, UserError, type HttpResponse, type RequestOptions } from "../http.js";
 import { readRange, type MediaFile } from "../media.js";
 import { pollUntil } from "./common.js";
 import type { AccountDraft, Connector, Platform, PublishContext } from "./types.js";
@@ -88,6 +88,23 @@ export function toLittleText(text: string): string {
   return out + escapeLittle(text.slice(last));
 }
 
+/** Pages the member can post as: Administrator or Content Admin roles (each (Page, role) pair is its own row). */
+async function postingOrgs(config: Config, token: string): Promise<Set<string>> {
+  const orgs = new Set<string>();
+  const count = 100;
+  for (let start = 0; start < 2000; start += count) {
+    const acls = await li(config, "organizationAcls", token, { query: { q: "roleAssignee", state: "APPROVED", start, count } });
+    const elements: any[] = acls.data?.elements ?? [];
+    for (const el of elements) {
+      const urn: string | undefined = el.organization ?? el.organizationTarget;
+      if (urn && ["ADMINISTRATOR", "CONTENT_ADMINISTRATOR"].includes(el.role)) orgs.add(urn);
+    }
+    const total = acls.data?.paging?.total;
+    if (elements.length < count || (typeof total === "number" && start + count >= total)) break;
+  }
+  return orgs;
+}
+
 async function tokenRequest(form: Record<string, string>) {
   const res = await request("https://www.linkedin.com/oauth/v2/accessToken", { method: "POST", form });
   return res.data as {
@@ -151,21 +168,7 @@ export const linkedinConnector: Connector = {
     ];
 
     if (config.linkedin.organizations) {
-      // Admins and Content Admins can post as the Page. Each (Page, role) pair is its own row, so dedupe.
-      const orgs = new Set<string>();
-      const count = 100;
-      for (let start = 0; start < 2000; start += count) {
-        const acls = await li(config, "organizationAcls", t.access_token, {
-          query: { q: "roleAssignee", state: "APPROVED", start, count },
-        });
-        const elements: any[] = acls.data?.elements ?? [];
-        for (const el of elements) {
-          const urn: string | undefined = el.organization ?? el.organizationTarget;
-          if (urn && ["ADMINISTRATOR", "CONTENT_ADMINISTRATOR"].includes(el.role)) orgs.add(urn);
-        }
-        const total = acls.data?.paging?.total;
-        if (elements.length < count || (typeof total === "number" && start + count >= total)) break;
-      }
+      const orgs = await postingOrgs(config, t.access_token);
       for (const urn of orgs) {
         const id = urn.split(":").pop()!;
         let name = `LinkedIn Page ${id}`;
@@ -236,7 +239,8 @@ async function waitForImages(ctx: PublishContext, token: string, urns: string[])
           if (status === "PROCESSING_FAILED") throw new Error("LinkedIn couldn't process one of the images.");
           return status === "AVAILABLE" ? true : null;
         },
-        { intervalMs: 1500, maxIntervalMs: 10_000, timeoutMs: 3 * 60_000, what: "LinkedIn to process the images" },
+        // Nothing is published yet, so a timeout here is safe to retry later.
+        { intervalMs: 1500, maxIntervalMs: 10_000, timeoutMs: 5 * 60_000, what: "LinkedIn to process the images", retryableTimeout: true },
       );
     } catch (err) {
       // Member tokens (w_member_social) may not be allowed to read image status: give LinkedIn a moment instead.
@@ -382,8 +386,13 @@ export const linkedin: Platform = {
     const { accessToken: token } = (await ctx.credentials()) as LinkedInCredentials;
     const me = (await request("https://api.linkedin.com/v2/userinfo", { headers: { Authorization: `Bearer ${token}` } })).data;
     const who = me.name ?? "your LinkedIn profile";
-    return ctx.account.externalId.startsWith("urn:li:organization:")
-      ? `Logged in as ${who}; can post as the Page "${ctx.account.name}".`
-      : `Can post as ${who}.`;
+    if (!ctx.account.externalId.startsWith("urn:li:organization:")) return `Can post as ${who}.`;
+    const orgs = await postingOrgs(ctx.config, token);
+    if (!orgs.has(ctx.account.externalId)) {
+      throw new UserError(
+        `${who} no longer has an Administrator or Content Admin role on the Page "${ctx.account.name}", so posts to it would be rejected.`,
+      );
+    }
+    return `Logged in as ${who}; can post as the Page "${ctx.account.name}".`;
   },
 };

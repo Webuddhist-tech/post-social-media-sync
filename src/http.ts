@@ -26,6 +26,17 @@ export class UserError extends Error {
   }
 }
 
+/**
+ * Refreshing a login failed (network, 5xx, ...). Retryable, but never mistaken for a failed publish request:
+ * no post request was sent.
+ */
+export class RefreshError extends ApiError {
+  constructor(err: ApiError) {
+    super(`Couldn't refresh the login: ${err.message}`, err.status, err.body, err.retryable, err);
+    this.name = "RefreshError";
+  }
+}
+
 /** The platform rejected our token: the account must be reconnected. */
 export class AuthError extends Error {
   constructor(message: string) {
@@ -122,16 +133,24 @@ export function retryAfterMs(headers: Headers, now = Date.now()): number | null 
     const at = Date.parse(retryAfter);
     if (Number.isFinite(at)) return Math.max(0, at - now);
   }
-  // X: the 24-hour per-user cap wins when it is exhausted, else the 15-minute window.
-  const dailyReset = headers.get("x-user-limit-24hour-reset");
-  const reset = headers.get("x-user-limit-24hour-remaining") === "0" && dailyReset ? dailyReset : headers.get("x-rate-limit-reset");
-  if (reset && Number.isFinite(Number(reset))) return Math.max(0, Number(reset) * 1000 - now);
+  // X: an exhausted 24-hour cap (per user or for the whole app) wins over the 15-minute window.
+  const resets: number[] = [];
+  for (const scope of ["user", "app"]) {
+    const r = Number(headers.get(`x-${scope}-limit-24hour-reset`));
+    if (headers.get(`x-${scope}-limit-24hour-remaining`) === "0" && Number.isFinite(r) && r > 0) resets.push(r);
+  }
+  const window = Number(headers.get("x-rate-limit-reset"));
+  if (!resets.length && headers.get("x-rate-limit-reset") && Number.isFinite(window)) resets.push(window);
+  if (resets.length) return Math.max(0, Math.max(...resets) * 1000 - now);
+  // IETF draft RateLimit-Reset: Bluesky sends epoch seconds, the draft itself uses delta-seconds.
+  const rl = Number(headers.get("ratelimit-reset") ?? "");
+  if (headers.get("ratelimit-reset") && Number.isFinite(rl)) return Math.max(0, rl > 1e9 ? rl * 1000 - now : rl * 1000);
   return null;
 }
 
 /** A network failure, timeout or server error: we can't tell whether the platform acted on the request. */
 export function isUnknownOutcome(err: unknown): err is ApiError {
-  return err instanceof ApiError && err.retryable && (err.status === 0 || err.status >= 500);
+  return err instanceof ApiError && !(err instanceof RefreshError) && err.retryable && (err.status === 0 || err.status >= 500);
 }
 
 /**
@@ -184,7 +203,14 @@ export async function request<T = any>(url: string, opts: RequestOptions = {}): 
     throw new ApiError(`Network error talking to ${host}: ${reason}`, 0, null, true);
   }
 
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await res.text();
+  } catch (err) {
+    // The connection dropped (or timed out) while the body was arriving: same as any network failure.
+    const reason = err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err);
+    throw new ApiError(`Network error reading the response from ${new URL(target).host}: ${reason}`, 0, null, true);
+  }
   let data: any = text;
   if (text) {
     try {

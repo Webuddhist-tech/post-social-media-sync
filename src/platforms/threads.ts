@@ -1,7 +1,7 @@
-import { isUnknownOutcome, uncertainOutcome, UserError } from "../http.js";
+import { UserError } from "../http.js";
 import type { MediaFile } from "../media.js";
 import { pollUntil } from "./common.js";
-import { graph } from "./meta.js";
+import { graph, publishContainerOnce } from "./meta.js";
 import { URL_RE } from "../text.js";
 import type { Connector, Platform, PublishContext } from "./types.js";
 
@@ -158,25 +158,17 @@ export const threads: Platform = {
     await waitForContainer(ctx, containerId, token);
 
     ctx.progress("Publishing on Threads…");
-    let published: { id: string };
-    try {
-      published = await graph<{ id: string }>(`${API}/${userId}/threads_publish`, {
-        method: "POST",
-        form: { creation_id: containerId, access_token: token },
-      });
-    } catch (err) {
-      if (!isUnknownOutcome(err)) throw err;
-      // Lost response: Threads may have published anyway. Only retry if the container is certainly unpublished.
-      let status: string | null = null;
-      try {
-        status = (await graph(`${API}/${containerId}`, { query: { fields: "status", access_token: token } })).status ?? null;
-      } catch {
-        // unknown
-      }
-      if (status === "PUBLISHED") return { remoteId: containerId, url: null, note: "Published, but Threads didn't confirm it in time." };
-      if (status === "FINISHED") throw err;
-      throw uncertainOutcome("Threads", err);
+    const outcome = await publishContainerOnce({
+      platformName: "Threads",
+      sleep: ctx.sleep,
+      publish: () =>
+        graph<{ id: string }>(`${API}/${userId}/threads_publish`, { method: "POST", form: { creation_id: containerId, access_token: token } }),
+      status: async () => (await graph(`${API}/${containerId}`, { query: { fields: "status", access_token: token } })).status ?? null,
+    });
+    if ("publishedContainer" in outcome) {
+      return { remoteId: containerId, url: null, note: "Published, but Threads didn't confirm it in time, so there's no direct link." };
     }
+    const published = outcome;
     let url: string | null = null;
     try {
       url = (await graph(`${API}/${published.id}`, { query: { fields: "permalink", access_token: token } })).permalink ?? null;
