@@ -1,0 +1,22 @@
+services:
+  postsync:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - postsync-data:/data # database, uploads and the encryption key
+
+  # Optional: a free public HTTPS URL without opening ports (needed for Instagram photos / Threads media).
+  # Run `docker compose --profile tunnel up`, then copy the https://….trycloudflare.com URL from the
+  # logs into PUBLIC_BASE_URL and restart. For a stable URL use a named Cloudflare tunnel or your own domain.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate --url http://postsync:3000
+    depends_on:
+      - postsync
+
+volumes:
+  postsync-data:
