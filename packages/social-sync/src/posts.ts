@@ -233,7 +233,8 @@ export class PostService {
 
   async list(ownerId: string, opts: { limit?: number; before?: number } = {}): Promise<PostPage> {
     const limit = Math.min(100, Math.max(1, Math.floor(opts.limit ?? 20) || 20));
-    const rows = await this.db.listPosts(ownerId, limit, opts.before);
+    const before = typeof opts.before === "number" && Number.isFinite(opts.before) ? opts.before : undefined;
+    const rows = await this.db.listPosts(ownerId, limit, before);
     return { posts: await this.serialize(rows), nextBefore: rows.length === limit ? rows[rows.length - 1].created_at : null };
   }
 
