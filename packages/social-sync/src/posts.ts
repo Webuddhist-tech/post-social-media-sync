@@ -5,11 +5,26 @@ import type { MediaFile, MediaStore } from "./media.js";
 import { getPlatform } from "./platforms/index.js";
 import type { Platform, PublishInput } from "./platforms/types.js";
 import { newId } from "./storage/schema.js";
-import type { AccountRow, PostRow, Storage, TargetRow } from "./storage/types.js";
+import type { AccountRow, PostCursor, PostRow, Storage, TargetRow } from "./storage/types.js";
 import { measureText } from "./text.js";
 import type { PlatformId, PostPage, PostRequest, PublicPost, PublicTarget, TargetIssue, TargetRequest } from "./types.js";
 
 export type { PostRequest, TargetIssue, TargetRequest };
+
+const MAX_SCHEDULE_AHEAD_MS = 5 * 366 * 86400_000;
+
+/**
+ * Reads a `nextBefore` cursor ("<createdAt>_<id>"). A bare number still works as "created before"; anything else
+ * is ignored.
+ */
+export function parseCursor(raw: unknown): PostCursor | undefined {
+  if (typeof raw === "number") return Number.isSafeInteger(raw) && raw >= 0 ? { createdAt: raw, id: "" } : undefined;
+  if (typeof raw !== "string") return undefined;
+  const m = /^(\d{1,16})(?:_(.{1,200}))?$/s.exec(raw.trim());
+  if (!m) return undefined;
+  const createdAt = Number(m[1]);
+  return Number.isSafeInteger(createdAt) ? { createdAt, id: m[2] ?? "" } : undefined;
+}
 
 /** Fills in option defaults so the publisher always sees a complete set. */
 export function withDefaults(platform: Platform, options: Record<string, unknown> = {}): Record<string, unknown> {
@@ -180,9 +195,11 @@ export class PostService {
 
     let scheduledAt: number | null = null;
     if (req.scheduledAt !== undefined && req.scheduledAt !== null && req.scheduledAt !== "") {
-      scheduledAt = typeof req.scheduledAt === "number" ? req.scheduledAt : Date.parse(req.scheduledAt);
+      // Whole milliseconds: the databases store integers.
+      scheduledAt = Math.round(typeof req.scheduledAt === "number" ? req.scheduledAt : Date.parse(req.scheduledAt));
       if (!Number.isFinite(scheduledAt)) throw new UserError("scheduledAt must be an ISO date/time.");
       if (scheduledAt < Date.now() - 60_000) throw new UserError("The scheduled time is in the past.");
+      if (scheduledAt > Date.now() + MAX_SCHEDULE_AHEAD_MS) throw new UserError("The scheduled time is more than 5 years ahead.");
     }
 
     const media = await this.loadMedia(ownerId, req.mediaIds ?? []);
@@ -231,11 +248,12 @@ export class PostService {
     return row ? (await this.serialize([row]))[0] : null;
   }
 
-  async list(ownerId: string, opts: { limit?: number; before?: number } = {}): Promise<PostPage> {
+  /** Newest first. `before` is the previous page's `nextBefore`; an invalid cursor is ignored (first page). */
+  async list(ownerId: string, opts: { limit?: number; before?: string | null } = {}): Promise<PostPage> {
     const limit = Math.min(100, Math.max(1, Math.floor(opts.limit ?? 20) || 20));
-    const before = typeof opts.before === "number" && Number.isFinite(opts.before) ? opts.before : undefined;
-    const rows = await this.db.listPosts(ownerId, limit, before);
-    return { posts: await this.serialize(rows), nextBefore: rows.length === limit ? rows[rows.length - 1].created_at : null };
+    const rows = await this.db.listPosts(ownerId, limit, parseCursor(opts.before));
+    const last = rows[rows.length - 1];
+    return { posts: await this.serialize(rows), nextBefore: rows.length === limit ? `${last.created_at}_${last.id}` : null };
   }
 
   /**
@@ -245,11 +263,9 @@ export class PostService {
   async remove(ownerId: string, id: string): Promise<"deleted" | "not_found" | "running"> {
     const row = await this.db.getPost(ownerId, id);
     if (!row) return "not_found";
-    const targets = await this.db.targetsForPosts([row.id]);
-    if (targets.some((t) => t.status === "running")) return "running";
-    await this.db.deletePost(ownerId, row.id);
-    await this.media.removeIfUnused(JSON.parse(row.media_ids));
-    return "deleted";
+    const result = await this.db.deletePostIfIdle(ownerId, row.id);
+    if (result === "deleted") await this.media.removeIfUnused(JSON.parse(row.media_ids));
+    return result;
   }
 
   /** The input a target publishes, rebuilt from the stored post. */

@@ -68,6 +68,9 @@ const social = createPostSyncClient({ baseUrl: "/social" });
 // "Connect Facebook & Instagram" can be a plain link (cookie sessions):
 const href = social.connect.url("meta", { returnTo: "/settings/social" });
 
+// On the returnTo page: read the result, and finish the login if it asks for confirmation (?postsync=confirm)
+const result = await social.connect.finish(); // { status: "connected", count, … } | { status: "error", error, … } | null
+
 // Upload a File from an <input type="file">, then post it:
 const [video] = await social.media.upload(file, { onProgress: (fraction) => console.log(fraction) });
 await social.posts.create({
@@ -80,6 +83,10 @@ await social.posts.create({
 
 Register `https://app.example.com/social/oauth/<connector>/callback` as the redirect URI in each platform's developer
 console (`sync.redirectUri("meta")` returns the exact value).
+
+The package is ESM-only and needs Node.js 22.12+, which also lets CommonJS apps `require()` it. With Express or plain
+`node:http`, set `server.requestTimeout = 0` on the server `app.listen()` returns, or Node cuts off uploads that take
+longer than 5 minutes.
 
 **[docs/PLUGIN.md](docs/PLUGIN.md)** is the full guide: Fastify, NestJS, Next.js, Hono/Bun/Deno and plain
 `node:http`; the HTTP API; the client SDK with React examples; calling the engine from your own code and jobs;
@@ -115,7 +122,7 @@ cp .env.example .env          # set ADMIN_PASSWORD, PUBLIC_BASE_URL and platform
 docker compose up -d --build
 ```
 
-Data (database, uploads, encryption key) is kept in the `postsync-data` volume.
+Data (database, uploads, encryption key, the dashboard's logout time) is kept in the `postsync-data` volume.
 
 ### Giving it a public address
 
@@ -129,10 +136,17 @@ Platforms send the browser back to `PUBLIC_BASE_URL` after a login, most of them
       reverse_proxy localhost:3000
   }
   ```
-  and set `PUBLIC_BASE_URL=https://posts.example.com`.
+  and set `PUBLIC_BASE_URL=https://posts.example.com` and `TRUST_PROXY=uniquelocal` (the container receives
+  Caddy's requests from Docker's private network; use `TRUST_PROXY=loopback` if you run the server without
+  Docker).
 - **From your own computer**: `cloudflared tunnel --url http://localhost:3000` (or `ngrok http 3000`) and set
-  `PUBLIC_BASE_URL` to the HTTPS address it prints. `docker compose --profile tunnel up` runs the Cloudflare
-  tunnel for you.
+  `PUBLIC_BASE_URL` to the HTTPS address it prints, and `TRUST_PROXY=loopback` (`uniquelocal` if the server runs
+  in Docker). `docker compose --profile tunnel up` runs the Cloudflare tunnel for you (with
+  `TRUST_PROXY=uniquelocal`).
+
+`TRUST_PROXY` tells the server which proxy may report the visitor's address (`X-Forwarded-For`). It is off by
+default; behind a proxy without it, every visitor shares the proxy's address, so 5 wrong passwords from anyone lock
+everyone out of the dashboard for 15 minutes. [.env.example](.env.example) lists the accepted values.
 
 ### Headless mode for any backend
 
@@ -152,7 +166,11 @@ H=(-H "Authorization: Bearer $TOKEN" -H "X-Owner-Id: user_42")
 curl -s "${H[@]}" -H "Content-Type: application/json" $BASE/api/connect/meta \
   -d '{"returnTo": "https://app.example.com/settings"}'
 # → {"url":"https://www.facebook.com/…"}   After the login the browser lands on
-#   https://app.example.com/settings?postsync=connected&connector=…&count=2
+#   https://app.example.com/settings?postsync=confirm&connector=…&confirm=<token>
+#   Nothing is saved until your backend confirms it, for the user logged in to your app right now:
+curl -s "${H[@]}" -H "Content-Type: application/json" $BASE/api/connect/confirm \
+  -d '{"confirm": "<token>"}'
+# → {"accounts":[…],"connector":"Facebook & Instagram"}
 
 # 2. Upload media (repeat -F for several files)
 curl -s "${H[@]}" -F "file=@clip.mp4" $BASE/api/media
@@ -172,7 +190,10 @@ curl -s "${H[@]}" -H "Content-Type: application/json" $BASE/api/posts -d '{
 curl -s "${H[@]}" "$BASE/api/posts?limit=5"
 ```
 
-`returnTo` must be on `PUBLIC_BASE_URL` or on an origin listed in `ALLOWED_RETURN_ORIGINS`. Instead of polling, set
+`returnTo` must be on `PUBLIC_BASE_URL` or on an origin listed in `ALLOWED_RETURN_ORIGINS`. The confirm step ties
+the login to the user who started it, so a login link that ends up with someone else can't add their accounts to
+your user; send the `X-Owner-Id` of your logged-in user, never one taken from the URL. A token is single use and
+expires after 30 minutes; another owner gets 403. Instead of polling, set
 `WEBHOOK_URL` and `WEBHOOK_SECRET`: the server then POSTs every event (post published, failed, account needs
 reconnecting, …) to your backend, signed with HMAC-SHA256. See [docs/PLUGIN.md](docs/PLUGIN.md#non-node-backends)
 for the payload and signature checks in Node.js and Python, and [docs/openapi.yaml](docs/openapi.yaml) for every
@@ -255,7 +276,8 @@ PostSync engine (createPostSync) ──► Storage: SQLite or PostgreSQL
 - Several processes can share one PostgreSQL database: jobs are claimed atomically, a database rule allows one
   running job per account, and a job whose process died is marked failed (not silently re-posted, because it may
   already be live).
-- Expired or revoked logins mark the account "needs reconnect" and emit `account.needsReconnect`.
+- Expired or revoked logins mark the account "needs reconnect" and emit `account.needsReconnect` (once, when it
+  changes).
 
 ## Upgrading from 0.1
 
@@ -268,21 +290,32 @@ PostSync engine (createPostSync) ──► Storage: SQLite or PostgreSQL
 - Scripts using `API_TOKEN` keep working: the API is still under `/api` and, without an `X-Owner-Id` header, acts
   for the dashboard's owner. The login link is now `/api/connect/<connector>`.
 - `APP_SECRET` (or the generated `DATA_DIR/.app-secret`) is still used. Keep it.
+- **Behind a reverse proxy, set `TRUST_PROXY`** (see [above](#giving-it-a-public-address)). 0.1 believed
+  `X-Forwarded-For` from anyone; 0.2 ignores it unless `TRUST_PROXY` names the proxy.
+- **Bluesky accounts on a self-hosted server**: add its address to `BLUESKY_SERVERS` before reconnecting. Only
+  `https://bsky.social` is allowed by default.
+- `WEBHOOK_EVENTS` is checked at startup: an unknown event name stops the server.
 
 ## Security
 
-- The dashboard is protected by `ADMIN_PASSWORD` (5 wrong attempts lock that IP out for 15 minutes); sessions are
-  signed, HTTP-only cookies. Run it behind HTTPS. `API_TOKEN` gives full access to every owner's data: keep it on
-  your servers, never in a browser.
+- The dashboard is protected by `ADMIN_PASSWORD` (5 wrong attempts lock that IP out for 15 minutes; behind a proxy,
+  set `TRUST_PROXY` so the server sees the visitors' addresses); sessions are signed, HTTP-only cookies. Logging out
+  ends every dashboard session, in all browsers. Run it behind HTTPS. `API_TOKEN` gives full access to every
+  owner's data: keep it on your servers, never in a browser.
 - When you embed the package, your `authenticate` function decides who is calling. Routes that need a user reject
   requests it returns no id for.
+- An account login is saved only for the user who started it: the callback checks a cookie set in that user's
+  browser, or that the same user is logged in, and otherwise asks that user to confirm it. A login link sent to
+  someone else can't add their accounts to the sender.
 - Platform tokens are encrypted at rest with AES-256-GCM using the secret (`APP_SECRET` for the server, `secret`
   for the package). Back up the secret as well as the database, but keep them apart: without the secret the saved
   logins can't be read.
 - Uploaded files are served only at unguessable signed URLs, because Instagram and Threads must download them.
   Anyone who has such a link can fetch that file.
 - Cross-site browser requests that change data are rejected (Origin check), `returnTo` only goes back to allowed
-  origins, and downloading media from URLs is off unless you allow specific hosts.
+  origins, downloading media from URLs is off unless you allow specific hosts, and Bluesky logins only go to the
+  servers you allow (`BLUESKY_SERVERS`, or `platforms.bluesky.servers` for the package; `https://bsky.social` by
+  default).
 
 More in [docs/PLUGIN.md](docs/PLUGIN.md#security).
 

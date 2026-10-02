@@ -203,13 +203,11 @@ function route() {
   for (const v of $$(".view")) v.hidden = v.id !== `view-${name}`;
   for (const a of $$("#tabs a")) a.classList.toggle("active", a.dataset.view === name);
 
-  // After an OAuth login the server sends the browser back with ?postsync=connected|error&connector=…
+  // After an OAuth login the server sends the browser back with ?postsync=connected|confirm|error&connector=…
   const result = new URLSearchParams(location.search);
   const outcome = result.get("postsync");
-  if (outcome === "connected") {
-    const n = Number(result.get("count") ?? 1);
-    toast(`Connected ${n} ${result.get("connector")} account${n === 1 ? "" : "s"}.`, "ok");
-  }
+  if (outcome === "connected") toastConnected(Number(result.get("count") ?? 1), result.get("connector"));
+  if (outcome === "confirm") confirmLogin(result.get("confirm") ?? "", result.get("connector"));
   if (outcome === "error") toast(result.get("error") ?? "Connecting failed.", "bad");
   if (outcome || query) history.replaceState(null, "", `${location.pathname}#${name}`);
 
@@ -220,6 +218,22 @@ function route() {
   if (name === "compose") renderCompose();
 }
 window.addEventListener("hashchange", route);
+
+function toastConnected(n, connector) {
+  toast(`Connected ${n} ${connector} account${n === 1 ? "" : "s"}.`, "ok");
+}
+
+/** Finishes a login the server couldn't tie to this browser (?postsync=confirm, e.g. cookies blocked) as the logged-in user. */
+async function confirmLogin(token, connector) {
+  try {
+    const { accounts } = await api("/connect/confirm", { method: "POST", body: { confirm: token } });
+    toastConnected(accounts.length, connector);
+    await refreshAccounts();
+    route();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
 
 async function boot() {
   const [meta, { accounts }] = await Promise.all([api("/meta"), api("/accounts")]);
@@ -700,7 +714,7 @@ function renderMedia() {
 async function loadPosts(append = false) {
   clearTimeout(state.pollTimer);
   try {
-    const before = append && state.nextBefore ? `&before=${state.nextBefore}` : "";
+    const before = append && state.nextBefore ? `&before=${encodeURIComponent(state.nextBefore)}` : "";
     const { posts, nextBefore } = await api(`/posts?limit=20${before}`);
     state.posts = append ? [...state.posts, ...posts] : posts;
     state.nextBefore = nextBefore;

@@ -4,7 +4,9 @@ Every platform makes you register a free "developer app" before software can pos
 platform, give Post Sync the app's keys, and then connect accounts:
 
 - **Post Sync server (dashboard or headless):** put the keys in `.env`, restart the server, and click **Connect**
-  in the dashboard (**Accounts** tab), or call `POST /api/connect/<connector>` from your backend.
+  in the dashboard (**Accounts** tab), or call `POST /api/connect/<connector>` from your backend (and finish the
+  login with `POST /api/connect/confirm`, see the
+  [README](../README.md#headless-mode-for-any-backend)).
 - **The package in your own backend:** pass the keys in the `platforms` option of `createPostSync()` and use your
   own "Connect" buttons (see [PLUGIN.md](PLUGIN.md#oauth-redirect-uris)).
 
@@ -33,7 +35,7 @@ The dashboard's **Setup** tab shows the exact values. With the package, `sync.re
 | LinkedIn | `linkedin` | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` (`platforms.linkedin: { clientId, clientSecret }`) | Yes, for your personal profile. Company Pages need extra approval. |
 | Threads | `threads` | `THREADS_APP_ID`, `THREADS_APP_SECRET` (`platforms.threads: { appId, appSecret }`) | Yes for Threads testers on your app. |
 | X (Twitter) | `x` | `X_CLIENT_ID`, `X_CLIENT_SECRET` (`platforms.x: { clientId, clientSecret }`) | Yes, but the X API charges for posting. |
-| Bluesky | `bluesky` | none | Yes, with an app password. |
+| Bluesky | `bluesky` | none (`BLUESKY_SERVERS` for self-hosted servers; package: `platforms.bluesky.servers`) | Yes, with an app password. |
 
 > **Tip:** start with Bluesky. It needs no developer app, so you can check the whole flow in two minutes.
 >
@@ -62,6 +64,9 @@ the package, use it in `publicUrl`):
   Quick tunnels get a new random address every time they start. If the address changes, update
   `PUBLIC_BASE_URL` (or `publicUrl`) *and* the redirect URIs in every developer console. A named Cloudflare
   tunnel or a reserved ngrok domain keeps it stable.
+
+Behind a reverse proxy or a tunnel, also set `TRUST_PROXY` for the server (see [.env.example](../.env.example)), so
+its login lockout sees each visitor's address instead of the proxy's.
 
 ---
 
@@ -212,6 +217,12 @@ No developer app needed.
    If your account lives on a self-hosted server, enter its address under *Server*. (With the package, your form
    sends `{ identifier, appPassword, service? }` to `POST /connect/bluesky/credentials`; `describe()` lists these
    fields as `credentialFields`.)
+
+Self-hosted servers must be allowed first: only `https://bsky.social` is, by default. Add the server's address to
+`BLUESKY_SERVERS` (comma-separated URLs, e.g. `BLUESKY_SERVERS=https://bsky.social,https://pds.example.org`;
+package: `platforms.bluesky.servers`) and restart. Otherwise connecting fails with "This Bluesky server isn't
+allowed here", and accounts already connected through it are marked "needs reconnect". See
+[PLUGIN.md](PLUGIN.md#bluesky-servers) for the details.
 
 Good to know: posts are limited to 300 characters. Up to 4 images (Post Sync compresses anything over Bluesky's
 2 MB limit) or one video (up to 10 minutes / 300 MB; Bluesky requires a verified email for video). Links,

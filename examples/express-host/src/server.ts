@@ -41,6 +41,9 @@ const server = app.listen(port, env("HOST") || "0.0.0.0", (err?: Error) => {
   }
   console.log(`Example host app: ${baseUrl}  (Post Sync API at ${baseUrl}/social)`);
 });
+// Node answers 408 to any request still running after 5 minutes (server.requestTimeout), which cuts off large video
+// uploads on slow connections. Turn that off; headersTimeout still limits how long a client may take to send headers.
+server.requestTimeout = 0;
 
 // Graceful shutdown: stop taking requests, let running uploads finish (up to 10 s), close the database.
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

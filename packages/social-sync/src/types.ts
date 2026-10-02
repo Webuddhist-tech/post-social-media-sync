@@ -187,8 +187,8 @@ export interface CheckResult {
 
 export interface PostPage {
   posts: PublicPost[];
-  /** Pass as `before` to get the next page; null when there are no more posts. */
-  nextBefore: number | null;
+  /** Opaque cursor: pass it as `before` to get the next page; null when there are no more posts. */
+  nextBefore: string | null;
 }
 
 /** Events emitted by the engine (`sync.on(...)`), and sent to webhooks by the standalone server. */

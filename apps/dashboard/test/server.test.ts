@@ -520,12 +520,20 @@ describe("connecting accounts", () => {
       },
       { method: "GET", match: "https://api.linkedin.com/v2/userinfo", reply: () => ({ json: { sub: "abc123", name: "Tenzin" } }) },
     ]);
-    // The platform redirects the browser here: no login cookie or token involved.
+    // The platform redirects the browser here: no login cookie, token or binding cookie involved, so nothing proves
+    // this browser belongs to u1. The login waits until u1 confirms it.
     const callback = await app.inject({ url: `/api/oauth/linkedin/callback?code=CODE&state=${state}` });
     expect(callback.statusCode).toBe(302);
     const back = new URL(String(callback.headers.location));
     expect(back.origin + back.pathname).toBe("https://app.other.example/settings");
-    expect(Object.fromEntries(back.searchParams)).toEqual({ postsync: "connected", connector: "LinkedIn", count: "1" });
+    const { confirm, ...rest } = Object.fromEntries(back.searchParams);
+    expect(rest).toEqual({ postsync: "confirm", connector: "LinkedIn" });
+    expect(calls).toHaveLength(0);
+
+    // The backend finishes it for its logged-in user.
+    const confirmed = await api(app, "POST", "/connect/confirm", bearer("u1"), { confirm });
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json()).toEqual({ connector: "LinkedIn", accounts: [expect.objectContaining({ platform: "linkedin", ownerId: "u1" })] });
     expect(Object.fromEntries(calls[0].body as URLSearchParams)).toMatchObject({
       code: "CODE",
       grant_type: "authorization_code",
@@ -542,7 +550,50 @@ describe("connecting accounts", () => {
     const replayed = new URL(String(replay.headers.location));
     expect(replayed.origin + replayed.pathname + replayed.hash).toBe(`${SITE}/#accounts`);
     expect(replayed.searchParams.get("postsync")).toBe("error");
+    expect((await api(app, "POST", "/connect/confirm", bearer("u1"), { confirm })).statusCode).toBe(400);
     expect(calls).toHaveLength(2);
+  });
+
+  it("connects directly when the callback comes back to the browser that started it", async () => {
+    const app = await start({ platforms: META_KEYS });
+    const session = await login(app);
+    const res = await app.inject({ url: "/api/connect/meta?returnTo=/%23accounts", headers: { cookie: session } });
+    expect(res.statusCode).toBe(302);
+    const [binding] = setCookies(res);
+    expect(binding).toMatch(/^postsync_oauth=[\w-]+; Max-Age=1800; Path=\/api\/oauth\/; HttpOnly; SameSite=Lax; Secure$/);
+    const state = new URL(String(res.headers.location)).searchParams.get("state");
+
+    mockFetch([
+      { method: "GET", match: "https://graph.facebook.com/v26.0/oauth/access_token", reply: () => ({ json: { access_token: "T" } }) },
+      {
+        method: "GET",
+        match: "https://graph.facebook.com/v26.0/me/permissions",
+        reply: () => ({ json: { data: ["pages_show_list", "pages_manage_posts"].map((permission) => ({ permission, status: "granted" })) } }),
+      },
+      {
+        method: "GET",
+        match: "https://graph.facebook.com/v26.0/me/accounts",
+        reply: () => ({ json: { data: [{ id: "page-1", name: "My Page", access_token: "PT", tasks: ["CREATE_CONTENT"] }] } }),
+      },
+    ]);
+    // Only the binding cookie: enough on its own (the session would be too).
+    const callback = await app.inject({ url: `/api/oauth/meta/callback?code=CODE&state=${state}`, headers: { cookie: binding.split(";")[0] } });
+    const back = new URL(String(callback.headers.location));
+    expect(back.origin + back.pathname + back.hash).toBe(`${SITE}/#accounts`);
+    expect(Object.fromEntries(back.searchParams)).toEqual({ postsync: "connected", connector: "Facebook & Instagram", count: "1" });
+    expect(setCookies(callback)).toEqual(["postsync_oauth=; Max-Age=0; Path=/api/oauth/; HttpOnly; SameSite=Lax; Secure"]);
+    expect((await api(app, "GET", "/accounts", { cookie: session })).json().accounts).toEqual([expect.objectContaining({ platform: "facebook" })]);
+  });
+
+  it("refuses a login URL another owner started when it comes back to a logged-in dashboard", async () => {
+    const app = await start({ platforms: META_KEYS });
+    const started = await api(app, "POST", "/connect/meta", bearer("mallory"), {});
+    const state = new URL(started.json().url).searchParams.get("state");
+    const { fn } = mockFetch([]);
+    const callback = await app.inject({ url: `/api/oauth/meta/callback?code=CODE&state=${state}`, headers: { cookie: await login(app) } });
+    expect(new URL(String(callback.headers.location)).searchParams.get("error")).toMatch(/started by a different user/);
+    expect(fn).not.toHaveBeenCalled();
+    expect((await api(app, "GET", "/accounts", bearer("mallory"))).json().accounts).toEqual([]);
   });
 });
 

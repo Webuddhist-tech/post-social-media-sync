@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp, type HostApp } from "../src/app.js";
 
 const SECRET = "example-host-secret-example-host-secret";
-const PDS = "https://pds.example.net";
+const PDS = "https://morel.us-east.host.bsky.network";
 // 1x1 PNG
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 

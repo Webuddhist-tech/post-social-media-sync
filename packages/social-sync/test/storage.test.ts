@@ -295,6 +295,29 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       expect(ids(await s.listAccounts("alice")).sort()).toEqual([id, onX].sort());
     });
 
+    it("reports whether setting the status changed it", async () => {
+      const s = await fresh();
+      const id = await s.upsertAccount(account());
+      expect(await s.setAccountStatus(id, "active", null)).toBe(false);
+      expect(await s.setAccountStatus(id, "needs_reauth", "Revoked")).toBe(true);
+      // Already flagged: no change, but the latest reason is kept.
+      expect(await s.setAccountStatus(id, "needs_reauth", "Revoked again")).toBe(false);
+      expect(await s.getAccount(null, id)).toMatchObject({ status: "needs_reauth", status_message: "Revoked again" });
+      expect(await s.setAccountStatus(id, "active", null)).toBe(true);
+      expect(await s.getAccount(null, id)).toMatchObject({ status: "active", status_message: null });
+      expect(await s.setAccountStatus("missing", "needs_reauth", "x")).toBe(false);
+    });
+
+    it("reports a status change once when several storages set it at the same time", async () => {
+      const db = backend.database();
+      const storages = [db.open(), db.open(), db.open()];
+      await Promise.all(storages.map((s) => s.migrate()));
+      const id = await storages[0].upsertAccount(account());
+      const changed = await Promise.all([...storages, ...storages].map((s, i) => s.setAccountStatus(id, "needs_reauth", `Revoked ${i}`)));
+      expect(changed.filter(Boolean)).toHaveLength(1);
+      expect((await storages[1].getAccount(null, id))?.status).toBe("needs_reauth");
+    });
+
     it("updates credentials and reactivates", async () => {
       const s = await fresh();
       const id = await s.upsertAccount(account({ expires_at: T0 }));
@@ -363,7 +386,7 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
     expect(await s.getTarget("bob", failed.id)).toBeUndefined();
     expect(await s.retryTarget("bob", failed.id)).toBe(false);
     expect(await s.cancelTarget("bob", queued.id)).toBe(false);
-    expect(await s.deletePost("bob", p.id)).toBe(false);
+    expect(await s.deletePostIfIdle("bob", p.id)).toBe("not_found");
     expect(await s.deleteAccount("bob", accountId)).toBe(false);
 
     // Nothing changed for the owner; null means any owner.
@@ -385,6 +408,8 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       connector: "x",
       code_verifier: "verifier",
       return_to: "https://app.example.com/settings",
+      binding: "b1nd1ng",
+      callback_query: '{"code":"c"}',
       ...over,
     });
 
@@ -448,7 +473,7 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       expect(await s.orphanMedia(T0 + 5000)).toEqual([orphan]);
       expect(sorted(ids(await s.orphanMedia(T0 + 20_000)))).toEqual(sorted([orphan.id, recent.id]));
 
-      await s.deletePost("alice", p.id);
+      expect(await s.deletePostIfIdle("alice", p.id)).toBe("deleted");
       expect(await s.isMediaReferenced(used.id)).toBe(false);
       expect(sorted(ids(await s.orphanMedia(T0 + 5000)))).toEqual(sorted([used.id, orphan.id]));
     });
@@ -492,27 +517,54 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       expect(await s.getPost(null, p.id)).toEqual(p);
     });
 
-    it("lists newest first, with a created_at cursor", async () => {
+    it("lists newest first, with a (created_at, id) cursor", async () => {
       const s = await fresh();
       const p1 = post({ id: "p-1", created_at: T0 + 1 });
       const p2 = post({ id: "p-2", created_at: T0 + 2 });
       const p3a = post({ id: "p-3a", created_at: T0 + 3 });
       const p3b = post({ id: "p-3b", created_at: T0 + 3 });
-      const bobs = post({ id: "p-bob", owner_id: "bob", created_at: T0 + 4 });
-      for (const p of [p2, p3a, bobs, p1, p3b]) await s.insertPost(p, []);
+      const p3c = post({ id: "p-3c", created_at: T0 + 3 });
+      const bobs = post({ id: "p-bob", owner_id: "bob", created_at: T0 + 3 });
+      for (const p of [p2, p3a, bobs, p1, p3c, p3b]) await s.insertPost(p, []);
 
       const all = await s.listPosts("alice", 10);
-      expect(ids(all)).toEqual(["p-3b", "p-3a", "p-2", "p-1"]);
+      expect(ids(all)).toEqual(["p-3c", "p-3b", "p-3a", "p-2", "p-1"]);
       all.forEach(expectNumeric);
-      expect(all[2]).toEqual(p2);
-      expect(ids(await s.listPosts("alice", 2))).toEqual(["p-3b", "p-3a"]);
-      expect(ids(await s.listPosts("alice", 10, T0 + 3))).toEqual(["p-2", "p-1"]);
-      expect(ids(await s.listPosts("alice", 1, T0 + 3))).toEqual(["p-2"]);
-      expect(await s.listPosts("alice", 10, T0 + 1)).toEqual([]);
+      expect(all[3]).toEqual(p2);
+      expect(ids(await s.listPosts("alice", 2))).toEqual(["p-3c", "p-3b"]);
+      // Posts created in the same millisecond are neither skipped nor repeated across pages.
+      expect(ids(await s.listPosts("alice", 2, { createdAt: T0 + 3, id: "p-3b" }))).toEqual(["p-3a", "p-2"]);
+      expect(ids(await s.listPosts("alice", 10, { createdAt: T0 + 3, id: "p-3a" }))).toEqual(["p-2", "p-1"]);
+      expect(ids(await s.listPosts("alice", 1, { createdAt: T0 + 3, id: "p-3c" }))).toEqual(["p-3b"]);
+      // An empty id means "created before".
+      expect(ids(await s.listPosts("alice", 10, { createdAt: T0 + 3, id: "" }))).toEqual(["p-2", "p-1"]);
+      expect(await s.listPosts("alice", 10, { createdAt: T0 + 1, id: "p-1" })).toEqual([]);
       expect(ids(await s.listPosts("bob", 10))).toEqual(["p-bob"]);
+      expect(await s.listPosts("bob", 10, { createdAt: T0 + 3, id: "p-bob" })).toEqual([]);
     });
 
-    it("deletes a post with its targets and media links", async () => {
+    it("pages through many posts created in the same millisecond", async () => {
+      const s = await fresh();
+      const created: string[] = [];
+      for (let i = 0; i < 7; i++) {
+        const p = post({ created_at: T0 + (i < 5 ? 0 : i) });
+        await s.insertPost(p, []);
+        created.push(p.id);
+      }
+      const seen: string[] = [];
+      let before: { createdAt: number; id: string } | undefined;
+      for (let page = 0; page < 10; page++) {
+        const rows = await s.listPosts("alice", 2, before);
+        seen.push(...ids(rows));
+        if (rows.length < 2) break;
+        const last = rows[rows.length - 1];
+        before = { createdAt: last.created_at, id: last.id };
+      }
+      expect(sorted(seen)).toEqual(sorted(created));
+      expect(new Set(seen).size).toBe(created.length);
+    });
+
+    it("deletes a post with its targets and media links, unless a target is running", async () => {
       const s = await fresh();
       const m = media();
       await s.insertMedia(m);
@@ -522,14 +574,55 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       await s.insertPost(p, [t1, t2]);
       const other = await enqueue(s, "acc-1");
 
-      expect(await s.deletePost("alice", p.id)).toBe(true);
+      expect(await s.deletePostIfIdle("alice", p.id)).toBe("deleted");
       expect(await s.getPost(null, p.id)).toBeUndefined();
       expect(await s.targetsForPosts([p.id])).toEqual([]);
       expect(await s.getTarget(null, t1.id)).toBeUndefined();
       expect(await s.isMediaReferenced(m.id)).toBe(false);
       expect(await s.getMedia(null, m.id)).toEqual(m);
       expect(await s.getTarget(null, other.id)).toEqual(other);
-      expect(await s.deletePost("alice", p.id)).toBe(false);
+      expect(await s.deletePostIfIdle("alice", p.id)).toBe("not_found");
+
+      // A running target keeps its post.
+      const busy = post();
+      const running = target(busy, "acc-3", { status: "running", attempts: 1, lease_until: T0 + LEASE });
+      await s.insertPost(busy, [running, target(busy, "acc-4")]);
+      expect(await s.deletePostIfIdle("bob", busy.id)).toBe("not_found");
+      expect(await s.deletePostIfIdle("alice", busy.id)).toBe("running");
+      expect(await s.getPost(null, busy.id)).toEqual(busy);
+      expect(await s.targetsForPosts([busy.id])).toHaveLength(2);
+      await s.completeTarget(running.id, "r", null, null);
+      expect(await s.deletePostIfIdle("alice", busy.id)).toBe("deleted");
+    });
+
+    it("never deletes a post whose target is being claimed at the same time", async () => {
+      const db = backend.database();
+      const [a, b] = [db.open(), db.open()];
+      await Promise.all([a.migrate(), b.migrate()]);
+      const posts: TargetRow[] = [];
+      for (let i = 0; i < 12; i++) posts.push(await enqueue(a, `acc-${i}`));
+
+      // Claims and deletes race: every post ends up either deleted (and never claimed) or claimed (and kept).
+      const claimed: TargetRow[] = [];
+      const deletions = Promise.all(posts.map((t, i) => (i % 2 ? a : b).deletePostIfIdle("alice", t.post_id)));
+      const claims = (async () => {
+        for (let i = 0; i < 6; i++) claimed.push(...(await (i % 2 ? b : a).claimDueTargets(2, T0, T0 + LEASE)));
+      })();
+      const [results] = await Promise.all([deletions, claims]);
+
+      const claimedIds = new Set(ids(claimed));
+      for (const [i, t] of posts.entries()) {
+        const kept = await a.getPost(null, t.post_id);
+        if (results[i] === "deleted") {
+          expect(kept).toBeUndefined();
+          expect(claimedIds.has(t.id)).toBe(false);
+        } else {
+          expect(results[i]).toBe("running");
+          expect(claimedIds.has(t.id)).toBe(true);
+          expect(kept).toBeDefined();
+          expect((await a.getTarget(null, t.id))?.status).toBe("running");
+        }
+      }
     });
 
     it("lists the targets of several posts in a stable order", async () => {
@@ -668,7 +761,7 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       await s.claimDueTargets(10, T0, T0 + LEASE);
       await s.setTargetProgress(t.id, "Uploading");
 
-      await s.failTarget(t.id, "Rate limited", T0 + 60_000);
+      expect(await s.failTarget(t.id, "Rate limited", T0 + 60_000)).toBe(true);
       let row = await s.getTarget(null, t.id);
       expectNumeric(row);
       expect(row).toMatchObject({ status: "queued", run_at: T0 + 60_000, error: "Rate limited", progress: null, lease_until: null, attempts: 1 });
@@ -678,11 +771,44 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       expect(again).toMatchObject({ id: t.id, attempts: 2, error: null });
 
       const before = Date.now();
-      await s.failTarget(t.id, "Rejected", null);
+      expect(await s.failTarget(t.id, "Rejected", null)).toBe(true);
       row = await s.getTarget(null, t.id);
       expect(row).toMatchObject({ status: "failed", error: "Rejected", progress: null, lease_until: null, attempts: 2 });
       expect(row!.finished_at).toBeGreaterThanOrEqual(before);
       expect(await s.claimDueTargets(10, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)).toEqual([]);
+    });
+
+    it("fails only running targets, never one that finished or was cancelled", async () => {
+      const s = await fresh();
+      const statuses = ["queued", "succeeded", "failed", "cancelled"] as const;
+      const rows = new Map<string, TargetRow>();
+      for (const [i, status] of statuses.entries()) {
+        rows.set(status, await enqueue(s, `acc-${i}`, { status, attempts: 1, remote_id: status === "succeeded" ? "remote-1" : null, error: null }));
+      }
+      for (const st of statuses) {
+        expect(await s.failTarget(rows.get(st)!.id, "Late failure", null), st).toBe(false);
+        expect(await s.failTarget(rows.get(st)!.id, "Late failure", T0 + 60_000), st).toBe(false);
+      }
+      expect(await stored(s, [...rows.values()])).toEqual([...rows.values()]);
+      expect(await s.failTarget("missing", "Nope", null)).toBe(false);
+
+      // A job whose lease ran out was reported failed elsewhere: its own late failure changes nothing.
+      const t = await enqueue(s, "acc-9", { status: "running", attempts: 1, lease_until: T0 - 1 });
+      await s.failExpiredLeases(T0, "Interrupted");
+      expect(await s.failTarget(t.id, "Timed out", T0 + 60_000)).toBe(false);
+      expect(await s.getTarget(null, t.id)).toMatchObject({ status: "failed", error: "Interrupted" });
+    });
+
+    it("never retries a target that has a remote id", async () => {
+      const s = await fresh();
+      // E.g. published, then marked failed by an older version or by hand.
+      const published = await enqueue(s, "acc-1", { status: "failed", attempts: 1, remote_id: "remote-1", error: "Boom" });
+      const cancelled = await enqueue(s, "acc-2", { status: "cancelled", remote_id: "remote-2" });
+      const plain = await enqueue(s, "acc-3", { status: "failed", attempts: 1, error: "Boom" });
+      expect(await s.retryTarget("alice", published.id)).toBe(false);
+      expect(await s.retryTarget("alice", cancelled.id)).toBe(false);
+      expect(await s.retryTarget("alice", plain.id)).toBe(true);
+      expect(await stored(s, [published, cancelled])).toEqual([published, cancelled]);
     });
 
     it("retries only failed or cancelled targets, and cancels only queued ones", async () => {
@@ -826,7 +952,7 @@ describe.each([sqlite, postgres])("$name storage", (backend) => {
       const [a, b] = [db.open(), db.open()];
       await Promise.all([a.migrate(), b.migrate()]);
       const now = Date.now();
-      await a.saveOAuthState({ state: "s", owner_id: "alice", connector: "x", code_verifier: null, return_to: null, created_at: now });
+      await a.saveOAuthState({ state: "s", owner_id: "alice", connector: "x", code_verifier: null, return_to: null, binding: null, callback_query: null, created_at: now });
       const results = await Promise.all([a.takeOAuthState("s", 0), b.takeOAuthState("s", 0)]);
       expect(results.filter(Boolean)).toHaveLength(1);
     });
@@ -1088,7 +1214,7 @@ describe("PGlite pool helper", () => {
 
 // ---- Bluesky mocks -------------------------------------------------------------------------------
 
-const PDS = "https://pds.example.net";
+const PDS = "https://morel.us-east.host.bsky.network";
 
 function blueskyRoutes() {
   return [

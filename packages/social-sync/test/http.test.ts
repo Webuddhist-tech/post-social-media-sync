@@ -114,7 +114,7 @@ function metaRoutes(): Route[] {
 }
 
 function blueskyRoutes(): Route[] {
-  const pds = "https://pds.example.net";
+  const pds = "https://morel.us-east.host.bsky.network";
   return [
     {
       method: "POST",
@@ -245,8 +245,10 @@ describe("HTTP handler", () => {
       const state = new URL(((await started.json()) as any).url).searchParams.get("state")!;
       const callback = `/oauth/meta/callback?code=the-code&state=${encodeURIComponent(state)}`;
 
-      // The platform redirects the browser here: no login needed (the state says who it is for).
-      const done = await call(handler, "GET", callback, { user: null });
+      // The platform redirects the browser here: no login needed (the state says who it is for, and the binding cookie
+      // that POST /connect set proves it's the same browser).
+      const cookie = started.headers.get("set-cookie")!.split(";")[0];
+      const done = await call(handler, "GET", callback, { user: null, headers: { cookie } });
       expect(done.status).toBe(302);
       const u = location(done);
       expect(u.origin + u.pathname).toBe(`${ORIGIN}/settings`);
@@ -582,10 +584,11 @@ describe("HTTP handler", () => {
       expect(unavailable.status).toBe(500);
     });
 
-    it("isn't asked for public routes", async () => {
-      const h = withAuth(() => { throw new Error("must not be called"); });
+    it("isn't required for public routes", async () => {
+      const h = withAuth(() => { throw new Error("nobody is logged in"); });
       const media = await sync.media.fromBuffer("alice", PNG, "dot.png");
       expect((await call(h, "GET", media.url)).status).toBe(200);
+      // OAuth callbacks ask who is logged in, but a failing hook just means nobody.
       expect((await call(h, "GET", "/oauth/meta/callback?state=x")).status).toBe(302);
     });
 
@@ -773,10 +776,9 @@ describe("Express adapter", () => {
     const invalid = await realFetch(`${base}/social/posts`, { method: "POST", headers: { "x-user": "alice", "content-type": "application/json" }, body: "{nope" });
     expect(invalid.status).toBe(400);
     expect(((await invalid.json()) as any).handledBy).toBe("express");
-    // A request the adapter can't turn into a web Request.
+    // A malformed Host header is no error: the request is served as if for localhost.
     const badHost = await rawRequest(base, "/social/platforms", { host: "[", "x-user": "alice" });
-    expect(badHost.status).toBe(500);
-    expect(JSON.parse(badHost.body).handledBy).toBe("express");
+    expect(badHost.status).toBe(200);
   });
 
   it("answers CORS preflights", async () => {
@@ -844,9 +846,14 @@ describe("node:http adapter", () => {
   });
 
   it("answers 500 when there is no next() to hand an error to", async () => {
-    const res = await rawRequest(base, "/social/platforms", { host: "[", "x-user": "alice" });
-    expect(res.status).toBe(500);
-    expect(res.body).toBe("Internal server error");
+    const broken = http.createServer(toNodeHandler({ basePath: "", fetch: () => Promise.reject(new Error("boom")) }));
+    try {
+      const res = await rawRequest(await listen(broken), "/social/platforms", { "x-user": "alice" });
+      expect(res.status).toBe(500);
+      expect(res.body).toBe("Internal server error");
+    } finally {
+      await closeServer(broken);
+    }
   });
 });
 
@@ -889,8 +896,9 @@ describe("Fastify adapter", () => {
     expect(new URL(callback.headers.location as string).searchParams.get("postsync")).toBe("error");
 
     const unknown = await app.inject({ method: "GET", url: "/social/nope", headers: { "x-user": "alice" } });
+    // Paths the API doesn't know go to Fastify's (or the host's) not-found handler.
     expect(unknown.statusCode).toBe(404);
-    expect(unknown.json()).toEqual({ error: "Not found" });
+    expect(unknown.json()).toMatchObject({ statusCode: 404, message: "Route GET:/social/nope not found" });
     expect(unknown.headers["x-post-sync-unmatched"]).toBeUndefined();
   });
 

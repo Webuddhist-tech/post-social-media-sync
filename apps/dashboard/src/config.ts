@@ -1,13 +1,20 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import type { ConnectorId, PlatformKeys, PostSyncEventName } from "post-social-media-sync";
+import { EVENT_NAMES } from "./webhooks.js";
 
 export interface DashboardConfig {
   port: number;
   host: string;
   /** Public URL of this server, without a trailing slash. The API (and OAuth callbacks) live under `<siteUrl>/api`. */
   siteUrl: string;
+  /**
+   * Which X-Forwarded-For hops to believe for the client address (login rate limit): false = none (default), true = all,
+   * the number of proxies in front of the server (only if it can't be reached directly), or the proxies' addresses/CIDR ranges.
+   */
+  trustProxy: boolean | number | string[];
   dataDir: string;
   secret: string;
   /** Serve the web dashboard (password login). false = headless: only the HTTP API, for your own backend/frontend. */
@@ -81,6 +88,41 @@ function origins(name: string): string[] {
   });
 }
 
+const PROXY_PRESETS = ["loopback", "linklocal", "uniquelocal"];
+
+/** An IP address, a CIDR range (or address/netmask), or one of proxy-addr's presets. */
+function isProxyAddress(entry: string): boolean {
+  if (PROXY_PRESETS.includes(entry)) return true;
+  const [ip, range, ...rest] = entry.split("/");
+  const version = net.isIP(ip);
+  if (!version || rest.length) return false;
+  if (range === undefined) return true;
+  if (/^\d{1,3}$/.test(range)) return Number(range) <= (version === 4 ? 32 : 128);
+  return version === 4 && net.isIPv4(range);
+}
+
+/**
+ * TRUST_PROXY: off by default, so a client connecting directly can't pick its own address with X-Forwarded-For.
+ * Behind a reverse proxy set it to the proxies' addresses (e.g. loopback, uniquelocal, 10.0.0.0/8), or to their number
+ * (usually 1) when the server is only reachable through them.
+ */
+function trustProxy(): boolean | number | string[] {
+  const raw = env("TRUST_PROXY");
+  const lower = raw.toLowerCase();
+  if (!raw || ["false", "off", "no"].includes(lower)) return false;
+  if (["true", "on", "yes"].includes(lower)) return true;
+  if (/^\d+$/.test(raw)) return Number(raw) || false;
+  const entries = envList("TRUST_PROXY");
+  for (const entry of entries) {
+    if (!isProxyAddress(entry)) {
+      throw new Error(
+        `TRUST_PROXY must be off, on, a number of proxies or a comma-separated list of IP addresses/CIDR ranges, got "${entry}"`,
+      );
+    }
+  }
+  return entries;
+}
+
 /** Loads `.env` from the working directory if present (without overriding real env vars). */
 export function loadDotEnv(file = path.resolve(process.cwd(), ".env")): void {
   if (fs.existsSync(file)) process.loadEnvFile(file);
@@ -141,11 +183,16 @@ export function loadConfig(): DashboardConfig {
     }
   }
   const webhookEvents = envList("WEBHOOK_EVENTS") as PostSyncEventName[];
+  const unknownEvents = webhookEvents.filter((e) => !EVENT_NAMES.includes(e));
+  if (unknownEvents.length) {
+    throw new Error(`WEBHOOK_EVENTS has unknown events: ${unknownEvents.join(", ")}. Valid events: ${EVENT_NAMES.join(", ")}`);
+  }
 
   return {
     port,
     host: env("HOST", "0.0.0.0"),
     siteUrl,
+    trustProxy: trustProxy(),
     dataDir,
     secret: resolveSecret(dataDir),
     dashboard,
@@ -179,6 +226,8 @@ export function loadConfig(): DashboardConfig {
       },
       google: { clientId: env("GOOGLE_CLIENT_ID"), clientSecret: env("GOOGLE_CLIENT_SECRET") },
       x: { clientId: env("X_CLIENT_ID"), clientSecret: env("X_CLIENT_SECRET") },
+      // Servers users may sign in to Bluesky through (default: https://bsky.social only).
+      bluesky: envList("BLUESKY_SERVERS").length ? { servers: origins("BLUESKY_SERVERS") } : undefined,
     },
   };
 }

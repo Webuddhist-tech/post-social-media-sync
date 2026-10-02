@@ -19,6 +19,8 @@ export async function parseMultipart<T>(
   try {
     bb = busboy({
       headers: { "content-type": type },
+      // Browsers send filenames as raw UTF-8 bytes (busboy would read them as latin1).
+      defParamCharset: "utf8",
       limits: { fileSize: opts.maxFileBytes, files: opts.maxFiles, fields: 50, fieldSize: 64 * 1024 },
     });
   } catch {
@@ -57,7 +59,7 @@ export async function parseMultipart<T>(
           stream.resume();
           return;
         }
-        results.push(await opts.onFile({ stream, filename: info.filename || "upload", mimeType: info.mimeType }));
+        results.push(await opts.onFile({ stream, filename: formFilename(info.filename) || "upload", mimeType: info.mimeType }));
       });
       chain.catch(abort);
       stream.on("limit", () => abort(new UserError(`File is larger than the ${Math.round(opts.maxFileBytes / 1024 / 1024)} MB upload limit.`)));
@@ -75,4 +77,9 @@ export async function parseMultipart<T>(
     source.on("error", (err) => abort(err));
     source.pipe(bb);
   });
+}
+
+/** Browsers escape `"`, CR and LF in multipart filenames as %22, %0D and %0A (and nothing else): undo that. */
+export function formFilename(name: string | undefined): string {
+  return (name ?? "").replace(/%(22|0d|0a)/gi, (escaped) => decodeURIComponent(escaped));
 }

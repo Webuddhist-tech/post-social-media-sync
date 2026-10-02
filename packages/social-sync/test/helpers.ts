@@ -30,6 +30,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     linkedin: { clientId: "li-id", clientSecret: "li-secret", version: null, organizations: false },
     google: { clientId: "g-id", clientSecret: "g-secret" },
     x: { clientId: "x-id", clientSecret: "x-secret" },
+    bluesky: { servers: ["https://bsky.social"] },
     ...overrides,
   };
 }

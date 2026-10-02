@@ -16,11 +16,12 @@ info:
     accounts, media or posts. When you embed the package, authentication is whatever your hook checks (your session
     cookie, a JWT, ...): the security schemes below describe the ready-made server only.
     A missing owner answers `401`; a 4xx error thrown by the hook (such as the ready-made server's `400` for a malformed
-    `X-Owner-Id`) is passed through with its status.
+    `X-Owner-Id`) is passed through with its status. The hook must return a non-blank string, a finite number or a
+    bigint; any other value (a boolean, an object, ...) also answers `401`.
 
     **Conventions**
-    - Bodies are JSON (`Content-Type: application/json`, 1 MB max by default, `413` above), except uploads
-      (`multipart/form-data`).
+    - Bodies are JSON (`Content-Type: application/json` or another `+json` media type, 1 MB max by default, `413`
+      above), except uploads (`multipart/form-data`). A body with another `Content-Type` answers `400`.
     - Errors are `{ "error": "message" }`; creating or validating a post adds `issues` (per-account problems).
     - Times are epoch milliseconds. Ids are opaque strings (UUIDs).
     - Every `GET` route also answers `HEAD`.
@@ -30,8 +31,8 @@ info:
     - With the `cors` option, `OPTIONS` preflight requests answer `204` with the CORS headers.
     - An error from a platform's API answers `502`; an unexpected server error `500`.
     - A path the handler doesn't know answers `404 { "error": "Not found" }` with the header `x-post-sync-unmatched: 1`
-      (the Express and Node adapters call `next()` instead, so your app's other routes keep working). A path with
-      invalid percent-encoding answers `400`.
+      (the Express and Node adapters call `next()` instead, and the Fastify plugin hands it to Fastify's not-found
+      handler, so your app's other routes keep working). A path with invalid percent-encoding answers `400`.
   license:
     name: MIT
     identifier: MIT
@@ -80,7 +81,8 @@ tags:
       Events the ready-made server POSTs to `WEBHOOK_URL` (see the `webhooks` section), for backends not written in
       Node.js. When you embed the package, subscribe with `sync.on(...)` / `sync.events.onAny(...)` instead.
 
-      - Which events: `WEBHOOK_EVENTS` (comma-separated); default every event except the frequent `target.progress`.
+      - Which events: `WEBHOOK_EVENTS` (comma-separated names from `EventName`, case-sensitive); default every event
+        except the frequent `target.progress`. An unknown name stops the server at startup.
       - Body: `{ "id", "event", "data", "createdAt" }`, where `data` is the event's payload.
       - Answer with any 2xx within 10 seconds. Redirects are not followed. Network errors, timeouts, 3xx, 408, 429 and
         5xx are retried, up to 4 attempts in total (after 1 s, 4 s and 16 s); other 4xx answers are not retried.
@@ -98,14 +100,25 @@ paths:
       summary: OAuth redirect URI
       description: |
         Register `<publicUrl>/oauth/<connector>/callback` as the redirect URI in each platform's developer console (also
-        listed as `redirectUri` in `GET /platforms`). The platform sends the browser here after the login; the server
-        saves the accounts for the owner who started the login and redirects the browser back to the `returnTo` given
-        when the login started (or the default page), with the result in the query string:
+        listed as `redirectUri` in `GET /platforms`). The platform sends the browser here after the login. The
+        single-use `state` parameter (valid for 30 minutes) identifies the login and the owner who started it.
+
+        The accounts are saved for that owner only when the callback can tell it comes from them: the browser sends
+        the `postsync_oauth` cookie set by `/connect/{connector}` for this login, or that owner is logged in here (the
+        `authenticate` hook is asked, but a missing owner or an error from it only means "nobody logged in", never a
+        `401`). The browser is then sent back to the `returnTo` given when the login started (or the default page),
+        with the result in the query string:
 
         - success: `?postsync=connected&connector=<connector name>&count=<number of accounts connected>`
-        - failure: `?postsync=error&connector=<connector name>&error=<message>`
+        - confirmation needed: `?postsync=confirm&connector=<connector name>&confirm=<token>`. Nothing tied the callback
+          to the owner who started the login (no cookie and nobody logged in: header/token auth, blocked third-party
+          cookies, a second login in another tab, or the login URL opened by someone else). The code has **not** been
+          exchanged and nothing is saved yet: the `returnTo` page must call `POST /connect/confirm` with the token, as
+          the logged-in owner.
+        - failure: `?postsync=error&connector=<connector name>&error=<message>`, including when a different owner is
+          logged in ("This login was started by a different user. Start it again from your account.").
 
-        The single-use `state` parameter (valid for 30 minutes) identifies the login, so no session is needed.
+        Every answer clears the `postsync_oauth` cookie and is sent with `Cache-Control: no-store`.
       security: []
       parameters:
         - $ref: "#/components/parameters/Connector"
@@ -121,12 +134,24 @@ paths:
           in: query
           description: Set by the platform when the login was cancelled or failed (also `error_reason`, `error_description`).
           schema: { type: string }
+        - name: postsync_oauth
+          in: cookie
+          required: false
+          description: The cookie set by `GET`/`POST /connect/{connector}` in the browser that started the login.
+          schema: { type: string }
       responses:
         "302":
-          description: Back to the `returnTo` page with `postsync`, `connector` and `count` or `error` added to its query.
+          description: >-
+            Back to the `returnTo` page with `postsync`, `connector` and `count`, `confirm` or `error` added to its
+            query.
           headers:
             Location:
               $ref: "#/components/headers/ConnectResultLocation"
+            Set-Cookie:
+              description: "Clears the binding cookie: `postsync_oauth=; Max-Age=0; Path=<publicUrl path>/oauth/; HttpOnly; SameSite=Lax` (+ `Secure` on https)."
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, const: no-store }
 
   /media/{sig}/{file}:
     parameters:
@@ -150,9 +175,9 @@ paths:
       operationId: getMediaFile
       summary: Download a media file
       description: >-
-        The `url` and `thumbnailUrl` of uploaded media. Public on purpose: Instagram, Threads and TikTok download
-        files from here, so `publicUrl` must be reachable from the internet for them. Supports byte ranges (video
-        players).
+        The `url` and `thumbnailUrl` of uploaded media. Public on purpose: Instagram (photos) and Threads (photos and
+        videos) download files from here, so `publicUrl` must be reachable from the internet for them. Every other
+        platform gets the file uploaded by the server. Supports byte ranges (video players).
       security: []
       responses:
         "200":
@@ -301,6 +326,76 @@ paths:
 
   # ---- connect --------------------------------------------------------------------------------------------------
 
+  /connect/confirm:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    post:
+      tags: [Connect]
+      operationId: connectConfirm
+      summary: Finish a login that needs confirmation
+      description: |
+        When the OAuth callback can't tell that the browser coming back belongs to the owner who started the login, it
+        saves nothing and sends the browser to `returnTo` with `?postsync=confirm&connector=<name>&confirm=<token>`.
+        Call this right away from that page, as the logged-in owner, with the token; then remove `postsync`,
+        `connector`, `count`, `error` and `confirm` from the address bar. The client SDK's `connect.finish()` does
+        both steps.
+
+        The token is single use (also when confirming fails) and expires 30 minutes after the callback. Only the owner
+        who started the login can confirm it.
+
+        With the ready-made server in headless mode (`DASHBOARD=off`) logins nearly always come back with
+        `postsync=confirm`, because the browser has neither the login cookie nor a session: your backend calls this
+        with `Authorization: Bearer <API_TOKEN>` and the `X-Owner-Id` of the user logged in to your app.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm:
+                  type: string
+                  description: The `confirm` query parameter the callback added to `returnTo`.
+            example: { confirm: "0hD3k…" }
+      responses:
+        "200":
+          description: The connected (or updated) accounts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accounts, connector]
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/PublicAccount" }
+                  connector:
+                    type: string
+                    description: The connector's display name.
+                    examples: [Facebook & Instagram]
+        "400":
+          description: >-
+            No token in the body, the token is unknown, already used or expired ("That login expired or was already
+            finished. Connect again."), the platform refused the code, or the body isn't JSON.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            Another owner started this login ("This login was started by a different user."; the token is used up), or
+            a cross-origin browser request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "502":
+          description: "The platform's API failed while exchanging the code (\"Connecting <name> failed: ...\")."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /connect/{connector}:
     parameters:
       - $ref: "#/components/parameters/OwnerId"
@@ -311,8 +406,9 @@ paths:
       summary: Start an OAuth login (browser navigation)
       description: |
         For cookie-based logins: link or navigate the browser here (`<a href="/social/connect/meta?returnTo=/settings">`).
-        It redirects to the platform's login page; afterwards the OAuth callback sends the browser back to `returnTo`
-        with the result in its query string.
+        It redirects to the platform's login page and sets the `postsync_oauth` cookie that ties the login to this
+        browser; afterwards the OAuth callback sends the browser back to `returnTo` with the result in its query
+        string.
 
         If the connector is unknown or its app keys aren't set, the browser is sent straight back to `returnTo` with
         `?postsync=error&connector=<connector id>&error=<message>`.
@@ -327,6 +423,11 @@ paths:
             Location:
               description: The platform's authorization URL, or `returnTo` with the error added.
               schema: { type: string, format: uri }
+            Set-Cookie:
+              $ref: "#/components/headers/OAuthBindingCookie"
+            Cache-Control:
+              description: "`no-store` on the redirect to the platform."
+              schema: { type: string }
         "400":
           description: "`returnTo` is not a path or an allowed origin."
           content:
@@ -340,7 +441,9 @@ paths:
       description: >-
         For single-page apps and token auth: returns the platform's login URL. Send the browser there
         (`window.location.assign(url)`); afterwards it comes back to `returnTo` with the result in the query string
-        (see the OAuth callback).
+        (see the OAuth callback). The answer also sets the `postsync_oauth` cookie; if the browser doesn't keep it
+        (a server-to-server call, or blocked third-party cookies), the login comes back with `postsync=confirm` and
+        must be finished with `POST /connect/confirm`.
       requestBody:
         required: false
         content:
@@ -354,6 +457,9 @@ paths:
       responses:
         "200":
           description: The platform's login URL.
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/OAuthBindingCookie"
           content:
             application/json:
               schema:
@@ -381,7 +487,11 @@ paths:
       description: >-
         For connectors of kind `credentials`: send the values of the connector's `credentialFields` (from
         `GET /platforms`). Bluesky takes `identifier` (handle or email), `appPassword` (an app password, not the main
-        password) and optionally `service` (the PDS URL, default https://bsky.social).
+        password) and optionally `service`: the address of the Bluesky server to sign in to. It must be a bare server
+        address (like `https://bsky.social`) that the server allows (package option `platforms.bluesky.servers`,
+        `BLUESKY_SERVERS` in the ready-made server; default: only https://bsky.social). Empty means the first allowed
+        server. The server the account's data lives on (its PDS) must be the sign-in server itself or a public https
+        host (under bsky.social: `*.bsky.network`). Bluesky requests never follow redirects.
       requestBody:
         required: true
         content:
@@ -408,14 +518,25 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/PublicAccount" }
         "400":
-          description: Unknown connector, missing fields, the platform rejected the login, or the body isn't JSON.
+          description: >-
+            Unknown connector, missing fields, the platform rejected the login, the body isn't JSON, or (Bluesky) a
+            server that isn't allowed ("This Bluesky server isn't allowed here. Ask the administrator to add it."), an
+            address that isn't a bare server address ("Enter just the Bluesky server's address, like
+            https://bsky.social."), or a PDS that isn't allowed ("Bluesky named a server for this account that isn't
+            allowed here, so nothing was sent to it.").
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/CrossOrigin" }
         "413": { $ref: "#/components/responses/TooLarge" }
-        "502": { $ref: "#/components/responses/PlatformError" }
+        "502":
+          description: >-
+            The platform's API failed, or (Bluesky) answered with a redirect ("<host> answered with a redirect
+            (<status>), which isn't followed.").
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   # ---- media ----------------------------------------------------------------------------------------------------
 
@@ -429,7 +550,8 @@ paths:
       description: >-
         Streams up to 20 files to the server (any field name). Each file may be up to the server's upload limit
         (`maxUploadMb` in `GET /platforms`, 4096 MB by default). Supported types are listed in `supportedMimeTypes`.
-        With ffmpeg on the server, videos are probed for size and duration and get a poster frame.
+        With ffmpeg on the server, videos are probed for size and duration and get a poster frame. File names are
+        read as UTF-8 (browsers' `%22`, `%0D` and `%0A` escapes are decoded).
       requestBody:
         required: true
         content:
@@ -645,8 +767,8 @@ paths:
                   post: { $ref: "#/components/schemas/PublicPost" }
         "400":
           description: >-
-            Malformed request, unknown account/platform/media, a scheduled time in the past, or some accounts can't
-            take this post (then `issues` lists the problems per account).
+            Malformed request, unknown account/platform/media, a scheduled time in the past or more than 5 years
+            ahead, or some accounts can't take this post (then `issues` lists the problems per account).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -672,8 +794,10 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
         - name: before
           in: query
-          description: "`nextBefore` from the previous page (epoch ms). Invalid values are ignored."
-          schema: { type: integer }
+          description: >-
+            `nextBefore` from the previous page: an opaque cursor, sent URL-encoded. A plain number (epoch ms) still
+            works and means "created before". Invalid values are ignored (you get the first page).
+          schema: { type: string }
       responses:
         "200":
           description: OK
@@ -730,12 +854,13 @@ paths:
       tags: [Targets]
       operationId: retryTarget
       summary: Queue a failed or cancelled target again
+      description: Refused for a target that has a post id on the platform (`remoteId`), since it was published.
       responses:
         "200": { $ref: "#/components/responses/Ok" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/CrossOrigin" }
         "409":
-          description: The target isn't failed or cancelled (or doesn't exist).
+          description: The target isn't failed or cancelled, has a `remoteId`, or doesn't exist.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -767,7 +892,9 @@ paths:
       summary: Log in to the dashboard (DASHBOARD=on only)
       description: >-
         Checks `ADMIN_PASSWORD` and sets the `pss_session` cookie (HttpOnly, SameSite=Lax, 30 days). The session acts
-        as the owner `default`. After 5 wrong passwords from one IP, logins from it are refused for 15 minutes.
+        as the owner `default`. After 5 wrong passwords from one IP, logins from it are refused for 15 minutes. The IP
+        is the connection's address; `X-Forwarded-For` is only believed from the proxies named in `TRUST_PROXY` (off by
+        default).
       security: []
       requestBody:
         required: true
@@ -808,7 +935,12 @@ paths:
     post:
       tags: [Dashboard server]
       operationId: dashboardLogout
-      summary: Log out of the dashboard (DASHBOARD=on only)
+      summary: Log out of the dashboard everywhere (DASHBOARD=on only)
+      description: >-
+        With a valid session cookie, ends **every** dashboard session: all browsers and devices, and other servers
+        sharing the same `DATA_DIR` within about 5 seconds (the cut-off time is kept in `DATA_DIR/.sessions-not-before`
+        and survives restarts). Without a valid session, it only clears this browser's cookie. `API_TOKEN` access is
+        not affected.
       security: []
       responses:
         "200":
@@ -1161,14 +1293,23 @@ components:
   headers:
     ConnectResultLocation:
       description: >-
-        `returnTo` (or the default page) plus `postsync=connected&connector=<name>&count=<n>`, or
+        `returnTo` (or the default page) plus `postsync=connected&connector=<name>&count=<n>`,
+        `postsync=confirm&connector=<name>&confirm=<token>` (finish with `POST /connect/confirm`), or
         `postsync=error&connector=<name>&error=<message>`.
       schema: { type: string, format: uri }
       examples:
         connected:
           value: "https://app.example.com/settings?postsync=connected&connector=Facebook+%26+Instagram&count=2"
+        confirm:
+          value: "https://app.example.com/settings?postsync=confirm&connector=Facebook+%26+Instagram&confirm=0hD3kq9Zx2Lw8m1vR5tYbN4cE7fJ6aP0sU3iO2gHkM"
         error:
           value: "https://app.example.com/settings?postsync=error&connector=TikTok&error=TikTok+login+was+cancelled+or+failed%3A+access_denied"
+    OAuthBindingCookie:
+      description: >-
+        Set when a login starts: `postsync_oauth=<random value>; Max-Age=1800; Path=<publicUrl path>/oauth/; HttpOnly;
+        SameSite=Lax` (+ `Secure` when `publicUrl` is https), e.g. `Path=/api/oauth/` for the ready-made server. The
+        OAuth callback reads it to tie the login to this browser, then clears it. Only its SHA-256 is stored.
+      schema: { type: string }
     ContentLength:
       schema: { type: integer }
     AcceptRanges:
@@ -1576,7 +1717,9 @@ components:
           additionalProperties:
             type: [string, "null"]
         scheduledAt:
-          description: ISO date-time or epoch ms. Omit (or null) to publish now.
+          description: >-
+            ISO date-time or epoch ms (rounded to whole milliseconds). Omit (or null) to publish now. At most a minute
+            in the past and at most 5 years ahead.
           oneOf:
             - { type: string, format: date-time }
             - { type: integer }
@@ -1618,8 +1761,10 @@ components:
           type: array
           items: { $ref: "#/components/schemas/PublicPost" }
         nextBefore:
-          type: [integer, "null"]
-          description: Pass as `before` to get the next page; null when there are no more posts.
+          type: [string, "null"]
+          description: >-
+            Opaque cursor: pass it (URL-encoded) as `before` to get the next page; null when there are no more posts.
+          examples: ["1790000000000_5f0e7a52-3c1d-4b8e-9a3f-2d6c1b0e9f11"]
 
     # ---- webhooks (ready-made server) ----
 

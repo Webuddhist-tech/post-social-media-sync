@@ -16,7 +16,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - postsync-data:/data # SQLite database, uploaded media and the generated APP_SECRET
+      - postsync-data:/data # SQLite database, uploaded media, the generated APP_SECRET and .sessions-not-before
     # With the optional PostgreSQL service below:
     # depends_on:
     #   postgres:
@@ -43,6 +43,8 @@ services:
   # Optional: a free public HTTPS URL without opening ports (needed for Instagram photos / Threads media).
   # Run `docker compose --profile tunnel up`, then copy the https://….trycloudflare.com URL from the
   # logs into PUBLIC_BASE_URL and restart. For a stable URL use a named Cloudflare tunnel or your own domain.
+  # Also set TRUST_PROXY=uniquelocal in .env (the tunnel reaches the server over the Docker network), so the
+  # login lockout sees visitors' addresses instead of the tunnel's.
   tunnel:
     image: cloudflare/cloudflared:latest
     profiles: ["tunnel"]

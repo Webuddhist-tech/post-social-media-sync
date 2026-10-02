@@ -2,7 +2,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { randomToken, sha256Hex } from "../crypto.js";
 import { ApiError, AuthError, UserError } from "../http.js";
+import { errorText } from "../logger.js";
 import { mimeFromFilename } from "../media.js";
 import { ConnectError, type PostSync } from "../sync.js";
 import { parseMultipart } from "./multipart.js";
@@ -10,7 +12,8 @@ import { parseMultipart } from "./multipart.js";
 export interface HandlerOptions {
   /**
    * Who is calling: return your user's (or workspace's) id, or null if not logged in (→ 401).
-   * Called only for routes that need it (not for OAuth callbacks or public media files).
+   * Called only for routes that need it (not for public media files). OAuth callbacks call it too but don't require a
+   * login: a logged-in owner other than the one who started the login is refused there, and errors count as "nobody".
    * Framework adapters (Express/Fastify) take an equivalent option that receives the framework's request.
    */
   authenticate?: (request: Request) => string | null | undefined | Promise<string | null | undefined>;
@@ -21,7 +24,10 @@ export interface HandlerOptions {
    * Default: the origin of `publicUrl`. Relative paths are always allowed.
    */
   allowedRedirectOrigins?: string[];
-  /** Where to send the browser after an OAuth login when no `returnTo` was given (default: `/` on publicUrl's origin). */
+  /**
+   * Where to send the browser after an OAuth login when no `returnTo` was given: a path on publicUrl's origin
+   * ("/settings") or a URL on an allowed origin, else createHandler throws (default: `/` on publicUrl's origin).
+   */
   defaultReturnTo?: string;
   /**
    * Allow POST /media/from-url, which makes your server download a URL. Return true for URLs you trust
@@ -59,6 +65,7 @@ interface Ctx {
   url: URL;
   params: Params;
   ownerId: string;
+  context?: RequestContext;
 }
 interface Route {
   method: string;
@@ -73,14 +80,27 @@ export const UNMATCHED_HEADER = "x-post-sync-unmatched";
 const json = (data: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", ...headers } });
 const fail = (status: number, error: string, extra: Record<string, unknown> = {}) => json({ error, ...extra }, status);
-const redirect = (location: string) => new Response(null, { status: 302, headers: { location } });
+const redirect = (location: string, headers: Record<string, string> = {}) =>
+  new Response(null, { status: 302, headers: { location, ...headers } });
+
+/** Cookie with a random nonce that ties an OAuth login to the browser that started it (its SHA-256 is the binding). */
+const OAUTH_COOKIE = "postsync_oauth";
+
+/** Reads one cookie from the request's Cookie header. */
+function readCookie(request: Request, name: string): string | null {
+  for (const part of (request.headers.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim() || null;
+  }
+  return null;
+}
 
 /** Creates the HTTP API for your frontend. Mount it at the path of `publicUrl`. */
 export function createHandler(sync: PostSync, options: HandlerOptions = {}): PostSyncHandler {
   const publicUrl = new URL(sync.config.publicBaseUrl);
   const basePath = (options.basePath ?? publicUrl.pathname).replace(/\/+$/, "");
   const allowedOrigins = new Set((options.allowedRedirectOrigins ?? [publicUrl.origin]).map((o) => new URL(o).origin));
-  const defaultReturnTo = options.defaultReturnTo ?? `${publicUrl.origin}/`;
+  const defaultReturnTo = options.defaultReturnTo ? resolveDefaultReturnTo(options.defaultReturnTo) : `${publicUrl.origin}/`;
   const maxJson = options.maxJsonBytes ?? 1024 * 1024;
   const trustedOrigins = new Set([publicUrl.origin, ...allowedOrigins, ...(options.cors?.origins ?? [])]);
 
@@ -114,16 +134,48 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
     return u.toString();
   }
 
+  /** An absolute defaultReturnTo, checked once here: a relative one is on publicUrl's origin, others must be allowed. */
+  function resolveDefaultReturnTo(raw: string): string {
+    const u = URL.canParse(raw, publicUrl.origin) ? new URL(raw, publicUrl.origin) : null;
+    if (!u || (u.protocol !== "https:" && u.protocol !== "http:") || (u.origin !== publicUrl.origin && !allowedOrigins.has(u.origin))) {
+      throw new Error(`defaultReturnTo "${raw}" must be a path or a URL on an allowed origin (add its origin to allowedRedirectOrigins).`);
+    }
+    return u.toString();
+  }
+
   function withParams(target: string, params: Record<string, string>): string {
-    const u = new URL(target);
+    const u = new URL(target, publicUrl.origin);
     for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
     return u.toString();
+  }
+
+  // The binding cookie is only sent to the OAuth callbacks, at the path browsers reach them by (publicUrl's).
+  const oauthCookiePath = `${publicUrl.pathname.replace(/\/+$/, "")}/oauth/`;
+  const oauthCookieAttrs = `Path=${oauthCookiePath}; HttpOnly; SameSite=Lax${publicUrl.protocol === "https:" ? "; Secure" : ""}`;
+  const clearOAuthCookie = `${OAUTH_COOKIE}=; Max-Age=0; ${oauthCookieAttrs}`;
+
+  /** A binding for `connect.start()` and the cookie that lets this browser's callback prove it. */
+  function newBinding(): { binding: string; cookie: string } {
+    const nonce = randomToken();
+    return { binding: sha256Hex(nonce), cookie: `${OAUTH_COOKIE}=${nonce}; Max-Age=1800; ${oauthCookieAttrs}` };
+  }
+
+  /** The logged-in owner on a public route, or null if nobody is (or the hook fails): never rejects the request. */
+  async function ownerIfAny(request: Request, context?: RequestContext): Promise<string | null> {
+    try {
+      const id = context?.getOwnerId ? await context.getOwnerId() : options.authenticate ? await options.authenticate(request) : null;
+      return ownerIdFrom(id);
+    } catch {
+      return null;
+    }
   }
 
   async function readJson(request: Request): Promise<any> {
     const type = request.headers.get("content-type") ?? "";
     if (!request.body) return {};
-    if (!type.includes("application/json")) {
+    // The media type itself, not a substring: "text/plain; x=application/json" needs no CORS preflight.
+    const essence = type.split(";")[0].trim().toLowerCase();
+    if (essence !== "application/json" && !essence.endsWith("+json")) {
       await request.body.cancel().catch(() => {});
       if (type) throw new UserError("Send JSON (Content-Type: application/json).");
       return {};
@@ -156,15 +208,25 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
 
   // ---- public routes (no login): OAuth callback and signed media files -----------------------
 
-  add("GET", "/oauth/:connector/callback", false, async ({ url, params }) => {
+  // The accounts go to the owner who started the login only if this browser proves it did (the cookie) or that owner
+  // is logged in here. Otherwise the login waits for that owner to confirm it (?postsync=confirm&confirm=<token>).
+  add("GET", "/oauth/:connector/callback", false, async ({ request, url, params, context }) => {
     const query = Object.fromEntries(url.searchParams);
+    const nonce = readCookie(request, OAUTH_COOKIE);
+    const cleared = { "set-cookie": clearOAuthCookie, "cache-control": "no-store" };
     try {
-      const result = await sync.connect.complete(params.connector, query);
+      const result = await sync.connect.complete(params.connector, query, {
+        binding: nonce ? sha256Hex(nonce) : null,
+        ownerId: await ownerIfAny(request, context),
+      });
       const back = result.returnTo ?? defaultReturnTo;
-      return redirect(withParams(back, { postsync: "connected", connector: result.connector, count: String(result.accounts.length) }));
+      if (result.status === "confirm") {
+        return redirect(withParams(back, { postsync: "confirm", connector: result.connector, confirm: result.confirmToken }), cleared);
+      }
+      return redirect(withParams(back, { postsync: "connected", connector: result.connector, count: String(result.accounts.length) }), cleared);
     } catch (err) {
       if (err instanceof ConnectError) {
-        return redirect(withParams(err.returnTo ?? defaultReturnTo, { postsync: "error", connector: err.connector, error: err.message }));
+        return redirect(withParams(err.returnTo ?? defaultReturnTo, { postsync: "error", connector: err.connector, error: err.message }), cleared);
       }
       throw err;
     }
@@ -199,18 +261,30 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
   add("GET", "/connect/:connector", true, async ({ ownerId, params, url }) => {
     const returnTo = resolveReturnTo(url.searchParams.get("returnTo"));
     try {
-      const { url: authUrl } = await sync.connect.start(ownerId, params.connector, { returnTo });
-      return redirect(authUrl);
+      const { binding, cookie } = newBinding();
+      const { url: authUrl } = await sync.connect.start(ownerId, params.connector, { returnTo, binding });
+      return redirect(authUrl, { "set-cookie": cookie, "cache-control": "no-store" });
     } catch (err) {
       if (err instanceof UserError) return redirect(withParams(returnTo, { postsync: "error", connector: params.connector, error: err.message }));
       throw err;
     }
   });
 
+  // A login the callback couldn't tie to the browser that started it: the logged-in owner finishes it with the token
+  // from ?postsync=confirm&confirm=<token>. Registered before /connect/:connector (no connector is called "confirm").
+  add("POST", "/connect/confirm", true, async ({ request, ownerId }) => {
+    const body = await readJson(request);
+    if (typeof body?.confirm !== "string" || !body.confirm) throw new UserError("Send { confirm } with the token from the confirm parameter.");
+    const { accounts, connector } = await sync.connect.confirm(ownerId, body.confirm);
+    return json({ accounts, connector });
+  });
+
   // SPA / token auth: POST /connect/meta { returnTo } → { url }; then set window.location to it.
   add("POST", "/connect/:connector", true, async ({ request, ownerId, params }) => {
     const body = await readJson(request);
-    return json(await sync.connect.start(ownerId, params.connector, { returnTo: resolveReturnTo(body?.returnTo) }));
+    const { binding, cookie } = newBinding();
+    const started = await sync.connect.start(ownerId, params.connector, { returnTo: resolveReturnTo(body?.returnTo), binding });
+    return json(started, 200, { "set-cookie": cookie });
   });
 
   add("POST", "/connect/:connector/credentials", true, async ({ request, ownerId, params }) => {
@@ -268,7 +342,7 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
   add("GET", "/posts", true, async ({ ownerId, url }) => {
     const limit = Number(url.searchParams.get("limit") ?? 20);
     const before = url.searchParams.get("before");
-    return json(await sync.posts.list(ownerId, { limit, before: before ? Number(before) : undefined }));
+    return json(await sync.posts.list(ownerId, { limit, before }));
   });
 
   add("GET", "/posts/:id", true, async ({ ownerId, params }) => {
@@ -362,6 +436,24 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
     return null;
   }
 
+  const warnedOwnerTypes = new Set<string>();
+
+  /**
+   * The owner id `authenticate` returned, or null (→ 401). Only a non-blank string or a finite number counts: String()
+   * would turn `false` or a whole user object into an id ("[object Object]") that many users then share.
+   */
+  function ownerIdFrom(id: unknown): string | null {
+    if (typeof id === "string") return id.trim() ? id : null;
+    if ((typeof id === "number" && Number.isFinite(id)) || typeof id === "bigint") return String(id);
+    if (id === null || id === undefined) return null;
+    const kind = typeof id === "number" ? `number (${id})` : Array.isArray(id) ? "array" : typeof id;
+    if (!warnedOwnerTypes.has(kind)) {
+      warnedOwnerTypes.add(kind);
+      sync.logger.warn(`authenticate returned a value of type ${kind}, not an id: answering 401. Return the user's id as a string, or null.`);
+    }
+    return null;
+  }
+
   async function dispatch(request: Request, context?: RequestContext): Promise<Response> {
     const url = new URL(request.url);
     let pathname = url.pathname;
@@ -384,11 +476,11 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
     try {
       let ownerId = "";
       if (found.route.auth) {
-        const id = context?.getOwnerId ? await context.getOwnerId() : options.authenticate ? await options.authenticate(request) : null;
-        if (id === null || id === undefined || id === "") return fail(401, "Not logged in.");
-        ownerId = String(id);
+        const id = ownerIdFrom(context?.getOwnerId ? await context.getOwnerId() : options.authenticate ? await options.authenticate(request) : null);
+        if (id === null) return fail(401, "Not logged in.");
+        ownerId = id;
       }
-      return await found.route.run({ request, url, params: found.params, ownerId });
+      return await found.route.run({ request, url, params: found.params, ownerId, context });
     } catch (err) {
       if (err instanceof UserError) return fail((err as any).status ?? 400, err.message, (err as any).issues ? { issues: (err as any).issues } : {});
       if (err instanceof AuthError) return fail(400, err.message);
@@ -396,7 +488,7 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
       // e.g. an http-errors style error thrown by your authenticate() hook
       const status = (err as any)?.status ?? (err as any)?.statusCode;
       if (typeof status === "number" && status >= 400 && status < 500) return fail(status, (err as Error).message);
-      sync.logger.error(`${request.method} ${url.pathname} failed`, err);
+      sync.logger.error(`${request.method} ${url.pathname} failed: ${errorText(err)}`, err);
       return fail(500, "Internal server error");
     }
   }

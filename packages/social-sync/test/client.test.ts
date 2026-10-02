@@ -14,7 +14,7 @@ const realFetch = globalThis.fetch;
 
 // 1x1 PNG
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
-const PDS = "https://pds.example.net";
+const PDS = "https://morel.us-east.host.bsky.network";
 
 function blueskyRoutes(): Route[] {
   return [
@@ -242,15 +242,26 @@ describe("client SDK", () => {
     expect(login.origin + login.pathname).toBe("https://www.facebook.com/v26.0/dialog/oauth");
     expect(login.searchParams.get("redirect_uri")).toBe(`${base}/social/oauth/meta/callback`);
 
-    // The platform sends the browser back to the callback.
+    // The platform sends the browser back to the callback. This browser has no binding cookie (the client started the
+    // login with header auth) and no login, so the login waits for the user to confirm it: finish() does that.
     mockFetch(metaRoutes());
     const callback = `${base}/social/oauth/meta/callback?code=c0de&state=${login.searchParams.get("state")}`;
     const back = await realFetch(callback, { redirect: "manual" });
     expect(back.status).toBe(302);
     const page = new URL(back.headers.get("location")!);
     expect(page.origin + page.pathname).toBe(`${base}/settings`);
-    expect(alice.connect.parseResult(page.search)).toEqual({ status: "connected", connector: "Facebook & Instagram", count: 1, error: undefined });
+    expect(alice.connect.parseResult(page.search)).toEqual({ status: "confirm", connector: "Facebook & Instagram", confirm: expect.any(String) });
+    expect(await alice.accounts.list()).toEqual([]);
+    expect(await alice.connect.finish(page.search)).toEqual({ status: "connected", connector: "Facebook & Instagram", count: 1 });
     expect((await alice.accounts.list()).map((a) => a.platform)).toEqual(["facebook"]);
+
+    // A browser that kept the binding cookie (set through the Express adapter) connects directly.
+    const started = await realFetch(`${base}/social/connect/meta`, { method: "POST", headers: { "x-user": "alice", "content-type": "application/json" }, body: "{}" });
+    const cookie = started.headers.get("set-cookie")!.split(";")[0];
+    const state = new URL(((await started.json()) as any).url).searchParams.get("state");
+    const direct = await realFetch(`${base}/social/oauth/meta/callback?code=c0de&state=${state}`, { redirect: "manual", headers: { cookie } });
+    expect(alice.connect.parseResult(new URL(direct.headers.get("location")!).search)).toMatchObject({ status: "connected", count: 1 });
+    expect(direct.headers.get("set-cookie")).toBe("postsync_oauth=; Max-Age=0; Path=/social/oauth/; HttpOnly; SameSite=Lax");
 
     const replay = new URL((await realFetch(callback, { redirect: "manual" })).headers.get("location")!);
     const failed = alice.connect.parseResult(replay.search);
@@ -365,7 +376,7 @@ describe("client SDK", () => {
 
     const first = await alice.posts.list({ limit: 2 });
     expect(first.posts.map((p) => p.text)).toEqual(["Post 3", "Post 2"]);
-    expect(typeof first.nextBefore).toBe("number");
+    expect(first.nextBefore).toMatch(/^\d+_.+/);
     const second = await alice.posts.list({ limit: 2, before: first.nextBefore });
     expect(second.posts.map((p) => p.text)).toEqual(["Post 1"]);
     expect(second.nextBefore).toBeNull();

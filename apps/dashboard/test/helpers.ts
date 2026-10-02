@@ -27,6 +27,7 @@ export function dashboardConfig(overrides: Partial<DashboardConfig> = {}): Dashb
     port: 0,
     host: "127.0.0.1",
     siteUrl: SITE,
+    trustProxy: false,
     dataDir: tempDir(),
     secret: TEST_SECRET,
     dashboard: true,
@@ -85,7 +86,7 @@ export function mockFetch(routes: MockRoute[]) {
   return { calls, fn };
 }
 
-export const PDS = "https://pds.example.net";
+export const PDS = "https://morel.us-east.host.bsky.network";
 
 /** Bluesky XRPC mocks: any handle/app password logs in; posts get the record key "3kp". */
 export function blueskyRoutes(): MockRoute[] {

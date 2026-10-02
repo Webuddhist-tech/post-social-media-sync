@@ -52,15 +52,21 @@ export interface UploadOptions {
   signal?: AbortSignal;
 }
 
-/** What the OAuth callback appended to your `returnTo` page. */
+/**
+ * What the OAuth callback appended to your `returnTo` page. Status "confirm": the callback couldn't tell that this
+ * browser started the login (e.g. cookies were blocked), so the logged-in user must finish it with
+ * `connect.confirm(confirm)`. `connect.finish()` handles that for you.
+ */
 export interface ConnectResult {
-  status: "connected" | "error";
+  status: "connected" | "confirm" | "error";
   /** Platform name, e.g. "Meta (Facebook + Instagram)". */
   connector: string;
   /** Number of accounts connected (status "connected"). */
   count?: number;
   /** Why it failed (status "error"). */
   error?: string;
+  /** Token for `connect.confirm()` (status "confirm"). */
+  confirm?: string;
 }
 
 export type PostSyncClient = ReturnType<typeof createPostSyncClient>;
@@ -137,6 +143,28 @@ export function createPostSyncClient(options: PostSyncClientOptions) {
     return media;
   }
 
+  /**
+   * Reads the result the OAuth callback added to your `returnTo` page (`?postsync=connected&...`).
+   * Returns null when the page wasn't opened by a login.
+   */
+  function parseResult(search: string = (globalThis as any).location?.search ?? ""): ConnectResult | null {
+    const q = new URLSearchParams(search);
+    const status = q.get("postsync");
+    if (status !== "connected" && status !== "confirm" && status !== "error") return null;
+    return {
+      status,
+      connector: q.get("connector") ?? "",
+      count: q.has("count") ? Number(q.get("count")) : undefined,
+      error: q.get("error") ?? undefined,
+      confirm: q.get("confirm") ?? undefined,
+    };
+  }
+
+  /** Finishes a login that came back with status "confirm", for the logged-in user. Returns the connected accounts. */
+  async function confirm(token: string): Promise<PublicAccount[]> {
+    return (await call<{ accounts: PublicAccount[] }>("POST", "/connect/confirm", { confirm: token })).accounts;
+  }
+
   return {
     /** Platforms, their options and limits, and which ones are set up. Use it to build your composer UI. */
     platforms: () => call<Description>("GET", "/platforms"),
@@ -172,16 +200,20 @@ export function createPostSyncClient(options: PostSyncClientOptions) {
        * Reads the result the OAuth callback added to your `returnTo` page (`?postsync=connected&...`).
        * Returns null when the page wasn't opened by a login.
        */
-      parseResult: (search: string = (globalThis as any).location?.search ?? ""): ConnectResult | null => {
-        const q = new URLSearchParams(search);
-        const status = q.get("postsync");
-        if (status !== "connected" && status !== "error") return null;
-        return {
-          status,
-          connector: q.get("connector") ?? "",
-          count: q.has("count") ? Number(q.get("count")) : undefined,
-          error: q.get("error") ?? undefined,
-        };
+      parseResult,
+      /** Finishes a login that came back with status "confirm" (its `confirm` token), for the logged-in user. */
+      confirm,
+      /**
+       * Reads the login result on your `returnTo` page and, for status "confirm", finishes the login as the logged-in
+       * user. Resolves to status "connected" or "error" (null when the page wasn't opened by a login); throws a
+       * PostSyncClientError when confirming fails. Remove the `postsync`, `connector`, `count`, `error` and `confirm`
+       * parameters from the address bar afterwards.
+       */
+      finish: async (search?: string): Promise<ConnectResult | null> => {
+        const result = parseResult(search);
+        if (result?.status !== "confirm") return result;
+        const accounts = await confirm(result.confirm ?? "");
+        return { status: "connected", connector: result.connector, count: accounts.length };
       },
     },
 
@@ -201,7 +233,7 @@ export function createPostSyncClient(options: PostSyncClientOptions) {
       /** Creates the post and queues publishing (now, or at `scheduledAt`). Throws with `issues` if it's invalid. */
       create: async (req: PostRequest) => (await call<{ post: PublicPost }>("POST", "/posts", req)).post,
       /** Newest first. Pass the previous page's `nextBefore` as `before` for the next page. */
-      list: (opts: { limit?: number; before?: number | null } = {}) => {
+      list: (opts: { limit?: number; before?: string | null } = {}) => {
         const q = new URLSearchParams();
         if (opts.limit) q.set("limit", String(opts.limit));
         if (opts.before) q.set("before", String(opts.before));

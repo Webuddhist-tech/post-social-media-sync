@@ -12,6 +12,22 @@ export interface WebhookOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+// A Record so the compiler flags any engine event missing here (or listed but no longer emitted).
+const EVENTS: Record<PostSyncEventName, true> = {
+  "post.created": true,
+  "target.started": true,
+  "target.progress": true,
+  "target.succeeded": true,
+  "target.failed": true,
+  "target.cancelled": true,
+  "account.connected": true,
+  "account.disconnected": true,
+  "account.needsReconnect": true,
+};
+
+/** Every event the engine emits: the valid values of WEBHOOK_EVENTS. */
+export const EVENT_NAMES: readonly PostSyncEventName[] = Object.freeze(Object.keys(EVENTS) as PostSyncEventName[]);
+
 /** Signature for a webhook body, as sent in X-Post-Sync-Signature. Receivers recompute and compare it. */
 export function signWebhook(secret: string, timestamp: string, body: string): string {
   return "sha256=" + crypto.createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");

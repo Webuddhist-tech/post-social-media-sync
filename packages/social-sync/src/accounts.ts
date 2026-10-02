@@ -1,9 +1,10 @@
 import type { Config } from "./config.js";
 import { randomToken, type Secrets } from "./crypto.js";
 import type { PostSyncEmitter } from "./events.js";
-import { ApiError, AuthError, RefreshError } from "./http.js";
+import { ApiError, AuthError, RefreshAuthError, RefreshError } from "./http.js";
+import { errorText, silentLogger, type Logger } from "./logger.js";
 import { getConnector } from "./platforms/index.js";
-import type { AccountDraft, AccountInfo, ConnectorId } from "./platforms/types.js";
+import type { AccountDraft, AccountInfo, Connector, ConnectorId } from "./platforms/types.js";
 import type { AccountRow, Storage } from "./storage/types.js";
 import type { PublicAccount } from "./types.js";
 
@@ -19,6 +20,7 @@ export class AccountService {
     private readonly secrets: Secrets,
     private readonly config: Config,
     private readonly events: PostSyncEmitter,
+    private readonly log: Logger = silentLogger,
   ) {}
 
   toPublic(row: AccountRow): PublicAccount {
@@ -85,19 +87,24 @@ export class AccountService {
     return true;
   }
 
-  async markNeedsReconnect(row: AccountRow, message: string): Promise<void> {
-    await this.db.setAccountStatus(row.id, "needs_reauth", message);
+  /** Flags the account for reconnecting. Emits account.needsReconnect only when it was active until now. */
+  async markNeedsReconnect(row: AccountRow, message: string): Promise<boolean> {
+    if (!(await this.db.setAccountStatus(row.id, "needs_reauth", message))) return false;
     this.events.emit("account.needsReconnect", {
       account: { ...this.toPublic(row), status: "needs_reauth", statusMessage: message },
       message,
     });
+    return true;
   }
 
   async markActive(row: AccountRow): Promise<void> {
     if (row.status !== "active") await this.db.setAccountStatus(row.id, "active", null);
   }
 
-  /** Decrypted credentials, refreshed first when the access token is (nearly) expired. */
+  /**
+   * Decrypted credentials, refreshed first when the access token is (nearly) expired. Throws RefreshAuthError when
+   * the platform rejects the saved login (the account is flagged for reconnecting by then).
+   */
   async credentials(accountId: string, opts: { force?: boolean } = {}): Promise<Record<string, any>> {
     const pending = this.refreshing.get(accountId);
     if (pending) return pending;
@@ -113,37 +120,48 @@ export class AccountService {
       if (row.expires_at !== null && row.expires_at < Date.now()) {
         const msg = `The ${connector?.name ?? row.platform} login expired. Reconnect the account.`;
         await this.markNeedsReconnect(row, msg);
-        throw new AuthError(msg);
+        throw new RefreshAuthError(msg);
       }
       return creds;
     }
 
-    const job = (async () => {
-      try {
-        const refreshed = await connector.refresh!(this.config, this.info(row), creds);
-        if (!refreshed) {
-          if (row.expires_at !== null && row.expires_at < Date.now()) {
-            throw new AuthError(`The ${connector.name} login expired. Reconnect the account.`);
-          }
-          return creds;
-        }
-        const encrypted = this.secrets.encrypt(refreshed.credentials);
-        const siblings = row.grant_id ? await this.db.accountsByGrant(row.owner_id, row.connector, row.grant_id) : [row];
-        for (const account of siblings.some((s) => s.id === row.id) ? siblings : [...siblings, row]) {
-          await this.db.updateAccountCredentials(account.id, encrypted, refreshed.expiresAt);
-        }
-        return refreshed.credentials;
-      } catch (err) {
-        if (err instanceof AuthError) await this.markNeedsReconnect(row, err.message);
-        // A refresh hiccup must never look like a failed publish request (see publishStep).
-        if (err instanceof ApiError && !(err instanceof RefreshError)) throw new RefreshError(err);
-        throw err;
-      } finally {
-        this.refreshing.delete(accountId);
-      }
-    })();
+    // Another caller may have started a refresh while the account was being read (X refresh tokens are single use).
+    const started = this.refreshing.get(accountId);
+    if (started) return started;
+    const job = this.refresh(connector, row, creds).finally(() => this.refreshing.delete(accountId));
     this.refreshing.set(accountId, job);
     return job;
+  }
+
+  private async refresh(connector: Connector, row: AccountRow, creds: Record<string, any>): Promise<Record<string, any>> {
+    try {
+      const refreshed = await connector.refresh!(this.config, this.info(row), creds);
+      if (!refreshed) {
+        if (row.expires_at !== null && row.expires_at < Date.now()) {
+          throw new AuthError(`The ${connector.name} login expired. Reconnect the account.`);
+        }
+        return creds;
+      }
+      const encrypted = this.secrets.encrypt(refreshed.credentials);
+      const siblings = row.grant_id ? await this.db.accountsByGrant(row.owner_id, row.connector, row.grant_id) : [row];
+      for (const account of siblings.some((s) => s.id === row.id) ? siblings : [...siblings, row]) {
+        await this.db.updateAccountCredentials(account.id, encrypted, refreshed.expiresAt);
+      }
+      return refreshed.credentials;
+    } catch (err) {
+      if (err instanceof AuthError) {
+        // Another process may have refreshed in the meantime, which made our (single-use) refresh token invalid.
+        const current = await this.db.getAccount(null, row.id).catch(() => undefined);
+        if (current && current.credentials !== row.credentials) return this.secrets.decrypt<Record<string, any>>(current.credentials);
+        await this.markNeedsReconnect(current ?? row, err.message).catch((e) =>
+          this.log.error(`couldn't flag ${row.platform}/${row.name} for reconnecting: ${errorText(e)}`, e),
+        );
+        throw err instanceof RefreshAuthError ? err : new RefreshAuthError(err.message);
+      }
+      // A refresh hiccup must never look like a failed publish request (see publishStep).
+      if (err instanceof ApiError && !(err instanceof RefreshError)) throw new RefreshError(err);
+      throw err;
+    }
   }
 
   /**
@@ -160,8 +178,9 @@ export class AccountService {
         } else if (row.expires_at! < Date.now() && !connector?.refresh) {
           await this.markNeedsReconnect(row, `The ${connector?.name ?? row.platform} login expired. Reconnect the account.`);
         }
-      } catch {
-        // credentials() already flagged auth failures; transient errors are retried next run
+      } catch (err) {
+        // credentials() already flagged rejected logins; anything else is retried next run.
+        if (!(err instanceof AuthError)) this.log.warn(`refreshing the ${row.platform}/${row.name} login failed: ${errorText(err)}`, err);
       }
     }
   }

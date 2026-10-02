@@ -1,4 +1,4 @@
-import type { AccountRow, MediaRow, NewAccount, OAuthStateRow, PostRow, Storage, TargetRow } from "./types.js";
+import type { AccountRow, MediaRow, NewAccount, OAuthStateRow, PostCursor, PostRow, Storage, TargetRow } from "./types.js";
 import { newId, schemaSql, type TableNames } from "./schema.js";
 
 /** The part of a `pg` client this storage uses. */
@@ -17,13 +17,20 @@ export interface PostgresStorageOptions {
   tablePrefix?: string;
   /** Postgres schema to create the tables in (default: the connection's search_path, usually "public"). */
   schema?: string;
+  /**
+   * Called when an idle connection of the pool created from a connection string fails (database restart, failover,
+   * a proxy's idle timeout). The pool replaces the connection by itself. Default: logs it with console.error.
+   */
+  onError?: (err: Error) => void;
 }
 
 /**
  * PostgreSQL storage. Safe for several processes or servers running the engine against one database.
  *
  * @param pool A `pg.Pool` you already have (shared with your app), or a connection string (a pool is created and
- *   closed by the storage; needs the `pg` package installed).
+ *   closed by the storage; needs the `pg` package installed). A pool you pass in needs its own
+ *   `pool.on("error", ...)` listener: `pg` reports failing idle connections there, and without a listener that
+ *   error crashes the process.
  */
 export function postgresStorage(pool: PgPoolLike | string, options: PostgresStorageOptions = {}): Storage {
   return new PostgresStorage(pool, options);
@@ -62,11 +69,13 @@ class PostgresStorage implements Storage {
   private readonly lockKey: string;
   private poolPromise: Promise<PgPoolLike> | null = null;
   private readonly ownsPool: boolean;
+  private readonly onError: (err: Error) => void;
 
   constructor(
     private readonly source: PgPoolLike | string,
     options: PostgresStorageOptions,
   ) {
+    this.onError = options.onError ?? ((err) => console.error(`[post-sync] PostgreSQL connection error: ${err?.message ?? err}`, err));
     const prefix = options.tablePrefix ?? "postsync_";
     if (!/^[a-z0-9_]*$/i.test(prefix)) throw new Error("tablePrefix may only contain letters, digits and _");
     if (options.schema !== undefined && !IDENT.test(options.schema)) throw new Error("schema must be a plain identifier");
@@ -88,7 +97,18 @@ class PostgresStorage implements Storage {
       const source = this.source;
       this.poolPromise =
         typeof source === "string"
-          ? import("pg").then((mod: any) => new (mod.default?.Pool ?? mod.Pool)({ connectionString: source }) as PgPoolLike)
+          ? import("pg").then((mod: any) => {
+              const pool = new (mod.default?.Pool ?? mod.Pool)({ connectionString: source });
+              // An idle connection that drops emits "error" on the pool; unheard, it would crash the host.
+              pool.on("error", (err: Error) => {
+                try {
+                  this.onError(err);
+                } catch {
+                  // a throwing handler must not turn into the crash we're preventing
+                }
+              });
+              return pool as PgPoolLike;
+            })
           : Promise.resolve(source);
     }
     return this.poolPromise;
@@ -169,8 +189,16 @@ class PostgresStorage implements Storage {
     );
   }
 
-  async setAccountStatus(id: string, status: AccountRow["status"], message: string | null): Promise<void> {
-    await this.query(`UPDATE ${this.t.accounts} SET status = $1, status_message = $2, updated_at = $3 WHERE id = $4`, [status, message, Date.now(), id]);
+  async setAccountStatus(id: string, status: AccountRow["status"], message: string | null): Promise<boolean> {
+    // One statement decides whether the status changed (the row lock serializes concurrent callers).
+    const now = Date.now();
+    const { rowCount } = await this.query(
+      `UPDATE ${this.t.accounts} SET status = $1, status_message = $2, updated_at = $3 WHERE id = $4 AND status <> $1`,
+      [status, message, now, id],
+    );
+    if ((rowCount ?? 0) > 0) return true;
+    await this.query(`UPDATE ${this.t.accounts} SET status_message = $1, updated_at = $2 WHERE id = $3 AND status = $4`, [message, now, id, status]);
+    return false;
   }
 
   async deleteAccount(ownerId: string, id: string): Promise<boolean> {
@@ -194,8 +222,9 @@ class PostgresStorage implements Storage {
   async saveOAuthState(row: OAuthStateRow): Promise<void> {
     await this.query(`DELETE FROM ${this.t.states} WHERE created_at < $1`, [Date.now() - 24 * 3600_000]);
     await this.query(
-      `INSERT INTO ${this.t.states} (state, owner_id, connector, code_verifier, return_to, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [row.state, row.owner_id, row.connector, row.code_verifier, row.return_to, row.created_at],
+      `INSERT INTO ${this.t.states} (state, owner_id, connector, code_verifier, return_to, binding, callback_query, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [row.state, row.owner_id, row.connector, row.code_verifier, row.return_to, row.binding ?? null, row.callback_query ?? null, row.created_at],
     );
   }
 
@@ -307,19 +336,27 @@ class PostgresStorage implements Storage {
     return rows[0] ? fix(rows[0]) : undefined;
   }
 
-  async listPosts(ownerId: string, limit: number, before?: number): Promise<PostRow[]> {
+  async listPosts(ownerId: string, limit: number, before?: PostCursor): Promise<PostRow[]> {
     const { rows } =
       before !== undefined
         ? await this.query(
-            `SELECT * FROM ${this.t.posts} WHERE owner_id = $1 AND created_at < $2 ORDER BY created_at DESC, id DESC LIMIT $3`,
-            [ownerId, before, limit],
+            `SELECT * FROM ${this.t.posts} WHERE owner_id = $1 AND (created_at < $2 OR (created_at = $2 AND id < $3))
+             ORDER BY created_at DESC, id DESC LIMIT $4`,
+            [ownerId, before.createdAt, before.id, limit],
           )
         : await this.query(`SELECT * FROM ${this.t.posts} WHERE owner_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`, [ownerId, limit]);
     return fixAll(rows);
   }
 
-  async deletePost(ownerId: string, id: string): Promise<boolean> {
-    return ((await this.query(`DELETE FROM ${this.t.posts} WHERE id = $1 AND owner_id = $2`, [id, ownerId])).rowCount ?? 0) > 0;
+  async deletePostIfIdle(ownerId: string, id: string): Promise<"deleted" | "running" | "not_found"> {
+    // Under the claim lock: no job can be claimed between the check and the delete.
+    return this.locked("claim", async (client) => {
+      if (!(await client.query(`SELECT 1 FROM ${this.t.posts} WHERE id = $1 AND owner_id = $2`, [id, ownerId])).rows.length) return "not_found";
+      const running = await client.query(`SELECT 1 FROM ${this.t.targets} WHERE post_id = $1 AND status = 'running' LIMIT 1`, [id]);
+      if (running.rows.length) return "running";
+      await client.query(`DELETE FROM ${this.t.posts} WHERE id = $1 AND owner_id = $2`, [id, ownerId]);
+      return "deleted";
+    });
   }
 
   async targetsForPosts(postIds: string[]): Promise<TargetRow[]> {
@@ -383,26 +420,27 @@ class PostgresStorage implements Storage {
     );
   }
 
-  async failTarget(id: string, error: string, retryAt: number | null): Promise<void> {
+  async failTarget(id: string, error: string, retryAt: number | null): Promise<boolean> {
     const now = Date.now();
-    if (retryAt) {
-      await this.query(
-        `UPDATE ${this.t.targets} SET status = 'queued', run_at = $1, error = $2, progress = NULL, lease_until = NULL, updated_at = $3 WHERE id = $4`,
-        [retryAt, error, now, id],
-      );
-    } else {
-      await this.query(
-        `UPDATE ${this.t.targets} SET status = 'failed', error = $1, progress = NULL, lease_until = NULL, finished_at = $2, updated_at = $2 WHERE id = $3`,
-        [error, now, id],
-      );
-    }
+    const { rowCount } = retryAt
+      ? await this.query(
+          `UPDATE ${this.t.targets} SET status = 'queued', run_at = $1, error = $2, progress = NULL, lease_until = NULL, updated_at = $3
+           WHERE id = $4 AND status = 'running'`,
+          [retryAt, error, now, id],
+        )
+      : await this.query(
+          `UPDATE ${this.t.targets} SET status = 'failed', error = $1, progress = NULL, lease_until = NULL, finished_at = $2, updated_at = $2
+           WHERE id = $3 AND status = 'running'`,
+          [error, now, id],
+        );
+    return (rowCount ?? 0) > 0;
   }
 
   async retryTarget(ownerId: string, id: string): Promise<boolean> {
     const now = Date.now();
     const { rowCount } = await this.query(
       `UPDATE ${this.t.targets} SET status = 'queued', run_at = $1, attempts = 0, error = NULL, progress = NULL, finished_at = NULL, updated_at = $1
-       WHERE id = $2 AND owner_id = $3 AND status IN ('failed', 'cancelled')`,
+       WHERE id = $2 AND owner_id = $3 AND status IN ('failed', 'cancelled') AND remote_id IS NULL`,
       [now, id, ownerId],
     );
     return (rowCount ?? 0) > 0;

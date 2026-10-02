@@ -4,12 +4,14 @@ import { sqliteStorage } from "post-social-media-sync/sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONNECTOR_ENV, loadConfig } from "../src/config.js";
 import { buildServer } from "../src/server.js";
+import { EVENT_NAMES } from "../src/webhooks.js";
 import { mockFetch, removeTempDirs, tempDir } from "./helpers.js";
 
 const VARS = [
   "PORT",
   "HOST",
   "PUBLIC_BASE_URL",
+  "TRUST_PROXY",
   "DATA_DIR",
   "APP_SECRET",
   "DASHBOARD",
@@ -26,6 +28,7 @@ const VARS = [
   "ALLOWED_RETURN_ORIGINS",
   "CORS_ORIGINS",
   "REMOTE_MEDIA_HOSTS",
+  "BLUESKY_SERVERS",
   "META_APP_ID",
   "META_APP_SECRET",
   "META_GRAPH_VERSION",
@@ -71,6 +74,7 @@ describe("loadConfig", () => {
       port: 3000,
       host: "0.0.0.0",
       siteUrl: "http://localhost:3000",
+      trustProxy: false,
       dataDir,
       secret: SECRET,
       dashboard: true,
@@ -198,6 +202,11 @@ describe("loadConfig", () => {
       [{ PORT: "eighty" }, /PORT must be a number/],
       [{ DASHBOARD: "maybe" }, /DASHBOARD must be on or off/],
       [{ WORKER: "sometimes" }, /WORKER must be on or off/],
+      [{ TRUST_PROXY: "proxy.internal" }, /TRUST_PROXY must be off, on, a number of proxies or a comma-separated list .*"proxy\.internal"/],
+      [{ TRUST_PROXY: "10.0.0.1, 10.0.0.0/33" }, /TRUST_PROXY must be .*"10\.0\.0\.0\/33"/],
+      [{ TRUST_PROXY: "::1/129" }, /TRUST_PROXY must be/],
+      [{ TRUST_PROXY: "10.0.0.0/8/8" }, /TRUST_PROXY must be/],
+      [{ TRUST_PROXY: "-1" }, /TRUST_PROXY must be/],
     ];
     for (const [vars, error] of cases) {
       vi.unstubAllEnvs();
@@ -234,6 +243,42 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/APP_SECRET must be at least 32 characters/);
     vi.stubEnv("APP_SECRET", "x".repeat(31));
     expect(() => loadConfig()).toThrow(/APP_SECRET must be at least 32 characters/);
+  });
+
+  it("reads TRUST_PROXY: off by default, on, a hop count or proxy addresses", () => {
+    const cases: Array<[string | undefined, unknown]> = [
+      [undefined, false],
+      ["", false],
+      ["false", false],
+      ["OFF", false],
+      ["0", false],
+      ["true", true],
+      ["on", true],
+      ["1", 1],
+      ["2", 2],
+      ["127.0.0.1", ["127.0.0.1"]],
+      [
+        " 10.0.0.0/8, ::1 ,fd00::/8, loopback, uniquelocal, 192.168.0.0/255.255.0.0 ",
+        ["10.0.0.0/8", "::1", "fd00::/8", "loopback", "uniquelocal", "192.168.0.0/255.255.0.0"],
+      ],
+    ];
+    for (const [value, expected] of cases) {
+      vi.stubEnv("TRUST_PROXY", value);
+      expect(loadConfig().trustProxy, String(value)).toEqual(expected);
+    }
+  });
+
+  it("accepts every engine event in WEBHOOK_EVENTS and rejects unknown ones", () => {
+    env({ WEBHOOK_URL: "https://hooks.example.com/in", WEBHOOK_EVENTS: EVENT_NAMES.join(",") });
+    expect(loadConfig().webhook?.events).toEqual([...EVENT_NAMES]);
+    expect(EVENT_NAMES).toContain("target.progress");
+    expect(EVENT_NAMES).toContain("account.needsReconnect");
+
+    env({ WEBHOOK_EVENTS: "target.failed, target.fail, post.published" });
+    expect(() => loadConfig()).toThrow(`WEBHOOK_EVENTS has unknown events: target.fail, post.published. Valid events: ${EVENT_NAMES.join(", ")}`);
+    // Checked even before WEBHOOK_URL is set, so a typo doesn't wait until the webhook is turned on.
+    env({ WEBHOOK_URL: "", WEBHOOK_EVENTS: "Target.Failed" });
+    expect(() => loadConfig()).toThrow(/WEBHOOK_EVENTS has unknown events: Target\.Failed\. Valid events: post\.created, /);
   });
 
   it("feeds WEBHOOK_EVENTS through to the running server", async () => {

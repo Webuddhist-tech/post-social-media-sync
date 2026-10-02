@@ -6,7 +6,7 @@ A small "existing app" (an Express 5 server with its own login and its own front
 | File | What it shows |
 | --- | --- |
 | [`src/app.ts`](src/app.ts) | `createApp()`: creates the engine, mounts the HTTP API at `/social` behind the app's own login, adds a host-owned route that publishes with `sync.posts.create()`, logs `target.succeeded` / `target.failed` events. |
-| [`src/server.ts`](src/server.ts) | Reads env vars, listens, shuts down gracefully (lets running uploads finish, closes the database). |
+| [`src/server.ts`](src/server.ts) | Reads env vars, listens with `server.requestTimeout = 0` (so Node doesn't cut off uploads that take longer than 5 minutes), shuts down gracefully (lets running uploads finish, closes the database). |
 | [`public/index.html`](public/index.html) | A custom frontend in plain JS (no build step) that talks to the REST API with `fetch`: list and check accounts, connect Bluesky with a form and other platforms with OAuth links, upload files, validate and publish (now or scheduled), history with retry/cancel. |
 | [`test/server.test.ts`](test/server.test.ts) | Smoke test against a real listening server (Bluesky is stubbed, nothing touches the network). |
 
@@ -62,6 +62,10 @@ await sync.posts.create(userId, { text: "New on the blog: ...", platforms: ["blu
 sync.on("target.succeeded", ({ target }) => notifyUser(target.ownerId, target.remoteUrl));
 sync.on("target.failed", ({ target, error, willRetry }) => { /* ... */ });
 
+// Node answers 408 to requests still running after 5 minutes by default: turn that off for big video uploads.
+const server = app.listen(port);
+server.requestTimeout = 0;
+
 process.once("SIGTERM", async () => { server.close(); await sync.close(); });
 ```
 
@@ -70,6 +74,14 @@ with your real session: `req.user?.id` with Passport, `req.session.userId` with 
 verified JWT, a workspace id, ... Browser OAuth links (`GET /social/connect/<connector>`) need cookie-based auth because
 a navigation can't carry an `Authorization` header; with token auth, call `POST /social/connect/<connector>` instead
 and send the browser to the returned `url`.
+
+After a login the browser comes back with `?postsync=connected` or `?postsync=error`, which `public/index.html`
+shows. The callback saves the accounts only for the user who started the login: it recognizes them by a cookie set
+when the login started, or by their session. When it can't (token auth without that cookie, blocked third-party
+cookies, a second login in another tab), it answers `?postsync=confirm&confirm=<token>` instead, and the page must
+finish the login with `POST /social/connect/confirm` and `{ "confirm": "<token>" }` as the logged-in user. The client
+SDK's `connect.finish()` does that. This example's page skips that step: it uses plain links, and its `SameSite=Lax`
+session cookie reaches the callback, so the callback always knows who is logged in.
 
 The full HTTP API (routes, bodies, status codes) is described in [docs/openapi.yaml](../../docs/openapi.yaml).
 

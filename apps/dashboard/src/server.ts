@@ -19,7 +19,7 @@ export interface BuildOptions {
   logger?: FastifyServerOptions["logger"];
   /** Storage override (tests). Default: DATABASE_URL (PostgreSQL) or SQLite in DATA_DIR. */
   storage?: Storage;
-  /** Overrides waiting in publishers (tests). */
+  /** Overrides waiting in publishers and webhook retries (tests). */
   sleep?: (ms: number) => Promise<void>;
   /** Start the publish worker (default: config.runWorker). */
   startWorker?: boolean;
@@ -31,10 +31,19 @@ declare module "fastify" {
   }
 }
 
+/**
+ * Fastify ignores a bare hop count (it can't tell a proxy from a client that connects directly), so TRUST_PROXY=<n>
+ * trusts the n nearest hops explicitly: only safe when the server can't be reached except through those proxies.
+ */
+function trustProxyOption(trust: DashboardConfig["trustProxy"]): FastifyServerOptions["trustProxy"] {
+  return typeof trust === "number" ? (_address: string, hop: number) => hop < trust : trust;
+}
+
 /** The ready-to-run server: the Post Sync API under /api, plus (unless DASHBOARD=off) the web dashboard. */
 export async function buildServer(opts: BuildOptions): Promise<FastifyInstance> {
   const { config } = opts;
-  const app = Fastify({ logger: opts.logger ?? false, trustProxy: true, bodyLimit: 64 * 1024 });
+  // trustProxy decides whose X-Forwarded-For counts as req.ip (the login rate limit's key): off unless TRUST_PROXY says so.
+  const app = Fastify({ logger: opts.logger ?? false, trustProxy: trustProxyOption(config.trustProxy), bodyLimit: 64 * 1024 });
 
   const logger: Logger = {
     info: (m, ...e) => app.log.info(e.length ? { extra: e } : {}, m),
@@ -55,12 +64,12 @@ export async function buildServer(opts: BuildOptions): Promise<FastifyInstance> 
     sleep: opts.sleep,
   });
   app.decorate("postSync", sync);
-  if (config.webhook) forwardEvents(sync, { ...config.webhook, log: logger });
+  if (config.webhook) forwardEvents(sync, { ...config.webhook, log: logger, sleep: opts.sleep });
 
   const auth = new Auth(config);
   await app.register(cookie);
 
-  // Security headers for every response, including the API's (which writes to the raw response).
+  // Security headers for every response, the API's included.
   app.addHook("onRequest", async (_req, reply) => {
     reply.raw.setHeader("X-Content-Type-Options", "nosniff");
     reply.raw.setHeader("X-Frame-Options", "DENY");
@@ -79,7 +88,14 @@ export async function buildServer(opts: BuildOptions): Promise<FastifyInstance> 
   if (config.dashboard) {
     await app.register(fastifyStatic, { root: PUBLIC_DIR, prefix: "/", index: ["index.html"], wildcard: false });
 
+    let warnedProxy = false;
     app.post<{ Body: { password?: string } }>("/api/login", async (req, reply) => {
+      if (config.trustProxy === false && req.headers["x-forwarded-for"] && !warnedProxy) {
+        warnedProxy = true;
+        req.log.warn(
+          "Login requests carry X-Forwarded-For but TRUST_PROXY is off: behind a reverse proxy, set TRUST_PROXY to its address (e.g. loopback or uniquelocal) so the login rate limit sees client addresses.",
+        );
+      }
       const result = auth.login(String(req.body?.password ?? ""), req.ip);
       if (!result.ok) {
         if (result.retryAfterSec) {
@@ -92,7 +108,9 @@ export async function buildServer(opts: BuildOptions): Promise<FastifyInstance> 
       return { ok: true };
     });
 
-    app.post("/api/logout", async (_req, reply) => {
+    app.post("/api/logout", async (req, reply) => {
+      // Session cookies can't be revoked one by one: logging out ends every session (other browsers too).
+      if (auth.hasSession(req)) auth.logoutEverywhere();
       auth.clearCookie(reply);
       return { ok: true };
     });

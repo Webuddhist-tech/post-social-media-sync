@@ -13,6 +13,12 @@ export interface TableNames {
   targets: string;
 }
 
+/**
+ * oauth_states columns added after the table was first released. Existing tables get them in `migrate()`
+ * (Postgres: in the schema below; SQLite has no ADD COLUMN IF NOT EXISTS, so its storage checks first).
+ */
+export const STATE_COLUMNS_ADDED = ["binding", "callback_query"] as const;
+
 /** Schema shared by the SQLite and PostgreSQL storages (timestamps are epoch milliseconds). */
 export function schemaSql(t: TableNames, dialect: "sqlite" | "postgres"): string {
   const int = dialect === "postgres" ? "BIGINT" : "INTEGER";
@@ -47,9 +53,11 @@ CREATE TABLE IF NOT EXISTS ${t.states} (
   connector TEXT NOT NULL,
   code_verifier TEXT,
   return_to TEXT,
+  binding TEXT,
+  callback_query TEXT,
   created_at ${int} NOT NULL
 );
-
+${dialect === "postgres" ? STATE_COLUMNS_ADDED.map((c) => `ALTER TABLE ${t.states} ADD COLUMN IF NOT EXISTS ${c} TEXT;\n`).join("") : ""}
 CREATE TABLE IF NOT EXISTS ${t.media} (
   id TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL,

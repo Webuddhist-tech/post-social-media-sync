@@ -22,6 +22,11 @@ Node.js 22.12+. ffmpeg on the server is recommended (video checks, thumbnails, i
 npm install post-social-media-sync better-sqlite3   # or: pg (PostgreSQL)
 ```
 
+The package is **ESM-only**. CommonJS apps can `require()` it too, since Node.js 22.12 supports loading ES modules
+that way. TypeScript finds its types with `moduleResolution` `bundler`, `nodenext`/`node16` in an ESM project,
+`nodenext` in a CommonJS project (TypeScript 5.8+), or `module: commonjs` with the classic `node10` resolution
+(e.g. NestJS 10). `node16` in a CommonJS project fails with TS1479: use `nodenext` (TypeScript 5.8+) or ESM.
+
 ## Express quick start
 
 ```ts
@@ -44,7 +49,8 @@ const sync = await createPostSync({
 });
 
 app.use("/social", postSyncExpress(sync, { authenticate: (req) => req.user?.id ?? null }));
-app.listen(3000);
+const server = app.listen(3000);
+server.requestTimeout = 0; // Node otherwise answers 408 to uploads that take longer than 5 minutes
 ```
 
 Register `https://app.example.com/social/oauth/<connector>/callback` as the redirect URI in each platform's developer
@@ -52,8 +58,11 @@ console (`sync.redirectUri("meta")` gives the exact value). Instagram photos and
 platform from `publicUrl`, so it must be reachable from the internet.
 
 Fastify: `await app.register(postSyncFastify, { prefix: "/social", sync, authenticate })` from
-`post-social-media-sync/fastify`. Next.js, Hono and other fetch runtimes:
-`createHandler(sync, { authenticate }).fetch(request)`.
+`post-social-media-sync/fastify`; responses go through Fastify's reply, so your hooks (e.g. `@fastify/cors`) apply.
+Next.js, Hono and other fetch runtimes: `createHandler(sync, { authenticate }).fetch(request)`.
+
+Bluesky users sign in with an app password on a server you allow: `platforms: { bluesky: { servers: [...] } }`
+(default `["https://bsky.social"]`; add self-hosted servers there).
 
 ## Client quick start
 
@@ -64,6 +73,8 @@ const social = createPostSyncClient({ baseUrl: "/social" });
 
 const { connectors, platforms } = await social.platforms(); // what's configured, each platform's rules and options
 const href = social.connect.url("meta", { returnTo: "/settings" }); // a plain "Connect" link (cookie sessions)
+// On the returnTo page: the login's result, after finishing it if it came back with ?postsync=confirm
+const result = await social.connect.finish(); // status "connected" | "error", or null
 const accounts = await social.accounts.list();
 
 const media = await social.media.upload(fileInput.files![0], { onProgress: (f) => console.log(f) });
@@ -89,11 +100,16 @@ await sync.posts.create(userId, {
 sync.on("target.succeeded", ({ target }) => console.log(target.remoteUrl));
 ```
 
+Publishing from cron instead of the built-in worker: `worker: { autoStart: false }`, then call
+`sync.worker.runDue()` every minute and `sync.worker.maintain()` (token refresh, cleanup of unused uploads) every
+hour.
+
 ## Documentation
 
 - [Integration guide](https://github.com/Webuddhist-tech/post-social-media-sync/blob/main/docs/PLUGIN.md):
-  Express, Fastify, NestJS, Next.js, Hono/Bun/Deno, the HTTP API, the client SDK with React examples, the worker
-  (cron/serverless), PostgreSQL and multi-server setups, events, security
+  Express, Fastify, NestJS, Next.js, Hono/Bun/Deno, the OAuth login flow, the HTTP API, the client SDK with React
+  examples, the worker (cron/serverless), logging, PostgreSQL and multi-server setups, custom storage, events,
+  security
 - [Platform setup](https://github.com/Webuddhist-tech/post-social-media-sync/blob/main/docs/PLATFORM_SETUP.md):
   creating each platform's developer app
 - [OpenAPI document](https://github.com/Webuddhist-tech/post-social-media-sync/blob/main/docs/openapi.yaml)

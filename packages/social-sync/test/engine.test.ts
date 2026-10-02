@@ -5,7 +5,7 @@ import { sqliteStorage } from "../src/storage/sqlite.js";
 import type { PostSyncEventName } from "../src/types.js";
 import { mockFetch, tempDir, TEST_SECRET } from "./helpers.js";
 
-const PDS = "https://pds.example.net";
+const PDS = "https://morel.us-east.host.bsky.network";
 const session = (did: string, handle: string) => ({
   did,
   handle,

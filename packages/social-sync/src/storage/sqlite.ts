@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
-import type { AccountRow, MediaRow, NewAccount, OAuthStateRow, PostRow, Storage, TargetRow } from "./types.js";
-import { newId, schemaSql } from "./schema.js";
+import type { AccountRow, MediaRow, NewAccount, OAuthStateRow, PostCursor, PostRow, Storage, TargetRow } from "./types.js";
+import { newId, schemaSql, STATE_COLUMNS_ADDED } from "./schema.js";
 
 export interface SqliteStorageOptions {
   /** Prefix for table names (default "postsync_"), so the tables can live next to yours. */
@@ -40,6 +40,7 @@ class SqliteStorage implements Storage {
 
   async migrate(): Promise<void> {
     this.db.exec(schemaSql(this.t, "sqlite"));
+    this.upgradeOAuthStates();
   }
 
   async close(): Promise<void> {
@@ -89,8 +90,15 @@ class SqliteStorage implements Storage {
       .run(credentials, expiresAt, Date.now(), id);
   }
 
-  async setAccountStatus(id: string, status: AccountRow["status"], message: string | null): Promise<void> {
-    this.db.prepare(`UPDATE ${this.t.accounts} SET status = ?, status_message = ?, updated_at = ? WHERE id = ?`).run(status, message, Date.now(), id);
+  async setAccountStatus(id: string, status: AccountRow["status"], message: string | null): Promise<boolean> {
+    // One statement decides whether the status changed, so concurrent callers can't both see a change.
+    const now = Date.now();
+    const changed =
+      this.db
+        .prepare(`UPDATE ${this.t.accounts} SET status = ?, status_message = ?, updated_at = ? WHERE id = ? AND status <> ?`)
+        .run(status, message, now, id, status).changes > 0;
+    if (!changed) this.db.prepare(`UPDATE ${this.t.accounts} SET status_message = ?, updated_at = ? WHERE id = ? AND status = ?`).run(message, now, id, status);
+    return changed;
   }
 
   async deleteAccount(ownerId: string, id: string): Promise<boolean> {
@@ -111,11 +119,24 @@ class SqliteStorage implements Storage {
 
   // ---- OAuth state ------------------------------------------------------------------------
 
+  /** Adds oauth_states columns newer than an existing table. */
+  private upgradeOAuthStates(): void {
+    this.db.transaction(() => {
+      const columns = this.db.prepare(`PRAGMA table_info(${this.t.states})`).all() as Array<{ name: string }>;
+      for (const c of STATE_COLUMNS_ADDED) {
+        if (!columns.some((col) => col.name === c)) this.db.exec(`ALTER TABLE ${this.t.states} ADD COLUMN ${c} TEXT`);
+      }
+    }).immediate();
+  }
+
   async saveOAuthState(row: OAuthStateRow): Promise<void> {
     this.db.prepare(`DELETE FROM ${this.t.states} WHERE created_at < ?`).run(Date.now() - 24 * 3600_000);
     this.db
-      .prepare(`INSERT INTO ${this.t.states} (state, owner_id, connector, code_verifier, return_to, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(row.state, row.owner_id, row.connector, row.code_verifier, row.return_to, row.created_at);
+      .prepare(
+        `INSERT INTO ${this.t.states} (state, owner_id, connector, code_verifier, return_to, binding, callback_query, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(row.state, row.owner_id, row.connector, row.code_verifier, row.return_to, row.binding ?? null, row.callback_query ?? null, row.created_at);
   }
 
   async takeOAuthState(state: string, notOlderThan: number): Promise<OAuthStateRow | undefined> {
@@ -186,17 +207,26 @@ class SqliteStorage implements Storage {
       : (this.db.prepare(`SELECT * FROM ${this.t.posts} WHERE id = ? AND owner_id = ?`).get(id, ownerId) as PostRow | undefined);
   }
 
-  async listPosts(ownerId: string, limit: number, before?: number): Promise<PostRow[]> {
+  async listPosts(ownerId: string, limit: number, before?: PostCursor): Promise<PostRow[]> {
     if (before !== undefined) {
       return this.db
-        .prepare(`SELECT * FROM ${this.t.posts} WHERE owner_id = ? AND created_at < ? ORDER BY created_at DESC, id DESC LIMIT ?`)
-        .all(ownerId, before, limit) as PostRow[];
+        .prepare(
+          `SELECT * FROM ${this.t.posts} WHERE owner_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+           ORDER BY created_at DESC, id DESC LIMIT ?`,
+        )
+        .all(ownerId, before.createdAt, before.createdAt, before.id, limit) as PostRow[];
     }
     return this.db.prepare(`SELECT * FROM ${this.t.posts} WHERE owner_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`).all(ownerId, limit) as PostRow[];
   }
 
-  async deletePost(ownerId: string, id: string): Promise<boolean> {
-    return this.db.prepare(`DELETE FROM ${this.t.posts} WHERE id = ? AND owner_id = ?`).run(id, ownerId).changes > 0;
+  async deletePostIfIdle(ownerId: string, id: string): Promise<"deleted" | "running" | "not_found"> {
+    // BEGIN IMMEDIATE, like claimDueTargets: no job can be claimed between the check and the delete.
+    return this.db.transaction(() => {
+      if (!this.db.prepare(`SELECT 1 FROM ${this.t.posts} WHERE id = ? AND owner_id = ?`).get(id, ownerId)) return "not_found" as const;
+      if (this.db.prepare(`SELECT 1 FROM ${this.t.targets} WHERE post_id = ? AND status = 'running' LIMIT 1`).get(id)) return "running" as const;
+      this.db.prepare(`DELETE FROM ${this.t.posts} WHERE id = ? AND owner_id = ?`).run(id, ownerId);
+      return "deleted" as const;
+    }).immediate();
   }
 
   async targetsForPosts(postIds: string[]): Promise<TargetRow[]> {
@@ -281,19 +311,26 @@ class SqliteStorage implements Storage {
       .run(remoteId, remoteUrl, note, now, now, id);
   }
 
-  async failTarget(id: string, error: string, retryAt: number | null): Promise<void> {
+  async failTarget(id: string, error: string, retryAt: number | null): Promise<boolean> {
     const now = Date.now();
     if (retryAt) {
-      this.db
-        .prepare(`UPDATE ${this.t.targets} SET status = 'queued', run_at = ?, error = ?, progress = NULL, lease_until = NULL, updated_at = ? WHERE id = ?`)
-        .run(retryAt, error, now, id);
-    } else {
+      return (
+        this.db
+          .prepare(
+            `UPDATE ${this.t.targets} SET status = 'queued', run_at = ?, error = ?, progress = NULL, lease_until = NULL, updated_at = ?
+             WHERE id = ? AND status = 'running'`,
+          )
+          .run(retryAt, error, now, id).changes > 0
+      );
+    }
+    return (
       this.db
         .prepare(
-          `UPDATE ${this.t.targets} SET status = 'failed', error = ?, progress = NULL, lease_until = NULL, finished_at = ?, updated_at = ? WHERE id = ?`,
+          `UPDATE ${this.t.targets} SET status = 'failed', error = ?, progress = NULL, lease_until = NULL, finished_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'running'`,
         )
-        .run(error, now, now, id);
-    }
+        .run(error, now, now, id).changes > 0
+    );
   }
 
   async retryTarget(ownerId: string, id: string): Promise<boolean> {
@@ -302,7 +339,7 @@ class SqliteStorage implements Storage {
       this.db
         .prepare(
           `UPDATE ${this.t.targets} SET status = 'queued', run_at = ?, attempts = 0, error = NULL, progress = NULL, finished_at = NULL, updated_at = ?
-           WHERE id = ? AND owner_id = ? AND status IN ('failed', 'cancelled')`,
+           WHERE id = ? AND owner_id = ? AND status IN ('failed', 'cancelled') AND remote_id IS NULL`,
         )
         .run(now, now, id, ownerId).changes > 0
     );

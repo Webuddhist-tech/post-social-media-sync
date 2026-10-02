@@ -379,7 +379,7 @@
       // ---- history ----
 
       async function loadPosts(more = false) {
-        const page = await call("GET", `${API}/posts?limit=10${more && state.nextBefore ? `&before=${state.nextBefore}` : ""}`);
+        const page = await call("GET", `${API}/posts?limit=10${more && state.nextBefore ? `&before=${encodeURIComponent(state.nextBefore)}` : ""}`);
         state.posts = more ? [...state.posts, ...page.posts] : page.posts;
         state.nextBefore = page.nextBefore;
         $("more").hidden = !page.nextBefore;
@@ -431,14 +431,24 @@
         if (state.user && busy) loadPosts().catch(() => {});
       }, 3000);
 
-      // ---- back from an OAuth login: ?postsync=connected&connector=...&count=... or ?postsync=error&error=... ----
+      // ---- back from an OAuth login: ?postsync=connected|confirm|error&connector=... ----
 
       const q = new URLSearchParams(location.search);
       if (q.get("postsync") === "connected") notice(`Connected ${q.get("count")} account(s) on ${q.get("connector")}.`);
       else if (q.get("postsync") === "error") notice(q.get("error") ?? "Connecting failed.", true);
       if (q.has("postsync")) history.replaceState(null, "", location.pathname);
 
-      loadSession().catch((err) => notice(err.message, true));
+      // "confirm": the server couldn't tell this browser started the login (e.g. a second tab), so finish it as the
+      // logged-in user. It's refused if someone else started it.
+      const confirming =
+        q.get("postsync") === "confirm"
+          ? call("POST", `${API}/connect/confirm`, { confirm: q.get("confirm") }).then(
+              (r) => notice(`Connected ${r.accounts.length} account(s) on ${r.connector}.`),
+              (err) => notice(err.message, true),
+            )
+          : Promise.resolve();
+
+      confirming.then(() => loadSession()).catch((err) => notice(err.message, true));
     </script>
   </body>
 </html>

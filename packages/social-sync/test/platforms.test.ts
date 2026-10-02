@@ -524,7 +524,7 @@ describe("X", () => {
 
 describe("Bluesky", () => {
   const config = testConfig();
-  const PDS = "https://pds.example.net";
+  const PDS = "https://morel.us-east.host.bsky.network";
   const session = {
     did: "did:plc:me",
     handle: "me.bsky.social",
@@ -574,7 +574,7 @@ describe("Bluesky", () => {
       input: { text: "clip", media: [fakeMedia(config, { kind: "video" })] },
     });
     await bluesky.publish(ctx);
-    expect(calls[1].url.searchParams.get("aud")).toBe("did:web:pds.example.net");
+    expect(calls[1].url.searchParams.get("aud")).toBe("did:web:morel.us-east.host.bsky.network");
     expect(calls[1].url.searchParams.get("lxm")).toBe("com.atproto.repo.uploadBlob");
     expect(calls[2].headers.get("authorization")).toBe("Bearer SVC");
     expect(calls[2].url.searchParams.get("did")).toBe("did:plc:me");

@@ -49,3 +49,8 @@ export function randomToken(bytes = 32): string {
 export function pkceChallenge(verifier: string): string {
   return crypto.createHash("sha256").update(verifier).digest("base64url");
 }
+
+/** SHA-256 of a value as hex (stores lookup keys for secrets without storing the secrets). */
+export function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}

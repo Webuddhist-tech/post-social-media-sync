@@ -159,6 +159,9 @@ async function addBlueskyAccount(owner = OWNER, handle = "me.bsky.social", engin
   return account.id;
 }
 
+/** The OAuth binding cookie a /connect response gave the browser, as a Cookie header for its callback. */
+const bindingCookie = (start: Reply) => ({ cookie: start.headers.get("set-cookie")!.split(";")[0] });
+
 /** Connects an X account through OAuth (its token lives 2 hours). Returns the account id and the exchange's requests. */
 async function connectX(owner = OWNER) {
   const start = await api("POST", "/connect/x", {}, owner);
@@ -168,7 +171,7 @@ async function connectX(owner = OWNER) {
     { method: "POST", match: `${XAPI}/oauth2/token`, reply: () => ({ json: { access_token: "OLD", refresh_token: "R1", expires_in: 7200 } }) },
     { method: "GET", match: `${XAPI}/users/me`, reply: () => ({ json: { data: { id: "42", name: "Me", username: "me" } } }) },
   ]);
-  const cb = await inject({ url: `/oauth/x/callback?code=CODE&state=${authUrl.searchParams.get("state")}` });
+  const cb = await inject({ url: `/oauth/x/callback?code=CODE&state=${authUrl.searchParams.get("state")}`, headers: bindingCookie(start) });
   expect(new URL(cb.headers.get("location")!).searchParams.get("postsync")).toBe("connected");
   const account = (await sync.accounts.list(owner)).find((a) => a.platform === "x")!;
   return { accountId: account.id, authUrl, calls };
@@ -593,10 +596,10 @@ describe("connecting accounts", () => {
     const state = authUrl.searchParams.get("state")!;
     expect(state).toBeTruthy();
 
-    // The platform sends the browser back; the callback needs no login (and ignores who is logged in): the state
-    // says whose accounts these are.
+    // The platform sends the browser back; the callback needs no login: the state says whose accounts these are, and
+    // the binding cookie proves this is the browser that started the login.
     const { calls } = mockFetch(metaRoutes());
-    const cb = await inject({ url: `/oauth/meta/callback?code=CODE&state=${state}`, owner: OTHER });
+    const cb = await inject({ url: `/oauth/meta/callback?code=CODE&state=${state}`, headers: bindingCookie(start) });
     expect(cb.status).toBe(302);
     const back = new URL(cb.headers.get("location")!);
     expect(back.origin + back.pathname).toBe("https://posts.example.com/settings");
@@ -628,7 +631,7 @@ describe("connecting accounts", () => {
 
   it("sends the browser back with an error when the login fails", async () => {
     // Declined on the platform's login page.
-    let start = (await api("POST", "/connect/meta", { returnTo: "https://posts.example.com/app" })).json();
+    const start = (await api("POST", "/connect/meta", { returnTo: "https://posts.example.com/app" })).json();
     let state = new URL(start.url).searchParams.get("state");
     const { fn } = mockFetch(metaRoutes());
     let cb = await inject({ url: `/oauth/meta/callback?error=access_denied&error_description=Permissions+error&state=${state}` });
@@ -640,12 +643,12 @@ describe("connecting accounts", () => {
     expect(fn).not.toHaveBeenCalled();
 
     // The platform refuses the code.
-    start = (await api("POST", "/connect/meta", {})).json();
-    state = new URL(start.url).searchParams.get("state");
+    const started = await api("POST", "/connect/meta", {});
+    state = new URL(started.json().url).searchParams.get("state");
     mockFetch([
       { match: `${GRAPH}/oauth/access_token`, reply: () => ({ status: 400, json: { error: { message: "Invalid verification code", code: 100 } } }) },
     ]);
-    cb = await inject({ url: `/oauth/meta/callback?code=BAD&state=${state}` });
+    cb = await inject({ url: `/oauth/meta/callback?code=BAD&state=${state}`, headers: bindingCookie(started) });
     back = new URL(cb.headers.get("location")!);
     expect(back.searchParams.get("postsync")).toBe("error");
     expect(back.searchParams.get("error")).toMatch(/Connecting Facebook & Instagram failed: .*Invalid verification code/);
@@ -674,7 +677,7 @@ describe("connecting accounts", () => {
       { method: "POST", match: "https://www.linkedin.com/oauth/v2/accessToken", reply: () => ({ json: { access_token: "LI_TOKEN", expires_in: 5184000 } }) },
       { method: "GET", match: "https://api.linkedin.com/v2/userinfo", reply: () => ({ json: { sub: "abc123", name: "Tenzin" } }) },
     ]);
-    const cb = await inject({ url: `/oauth/linkedin/callback?code=CODE&state=${state}` });
+    const cb = await inject({ url: `/oauth/linkedin/callback?code=CODE&state=${state}`, headers: bindingCookie(start) });
     expect(cb.status).toBe(302);
     const back = new URL(cb.headers.get("location")!);
     expect(back.origin + back.pathname).toBe("https://posts.example.com/");
@@ -845,11 +848,13 @@ describe("events", () => {
     expect((await engine.posts.get(OWNER, post.id))?.targets[0].status).toBe("succeeded");
     expect(done.map((e) => e.target.status)).toEqual(["succeeded"]);
     expect(errors).toEqual(
+      // The error's text is in the message itself (loggers like pino drop a trailing Error argument).
       expect.arrayContaining([
-        'listener for "account.connected" failed',
-        'listener for "post.created" failed',
-        'listener for "target.started" failed',
-        'listener for "target.succeeded" failed',
+        'listener for "account.connected" failed: listener bug',
+        'listener for "post.created" failed: listener bug',
+        'listener for "target.started" failed: listener bug',
+        'listener for "target.succeeded" failed: listener bug',
+        'listener for "target.succeeded" failed: async listener bug',
       ]),
     );
   });

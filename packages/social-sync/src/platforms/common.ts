@@ -1,4 +1,4 @@
-import { ApiError, AuthError } from "../http.js";
+import { ApiError, AuthError, RefreshAuthError } from "../http.js";
 import type { PublishContext } from "./types.js";
 
 export interface PollOptions {
@@ -41,13 +41,14 @@ export async function pollUntil<T>(sleep: (ms: number) => Promise<void>, check: 
 
 /**
  * Runs `fn` with a current access token. If the platform answers 401 (e.g. the token expired during a long
- * upload), forces one refresh and tries once more before giving up.
+ * upload), forces one refresh and tries once more before giving up. A rejected refresh is final: refreshing again
+ * would only be rejected again.
  */
 export async function withFreshToken<T>(ctx: PublishContext, pick: (credentials: any) => string, fn: (token: string) => Promise<T>): Promise<T> {
   try {
     return await fn(pick(await ctx.credentials()));
   } catch (err) {
-    if (!(err instanceof AuthError)) throw err;
+    if (!(err instanceof AuthError) || err instanceof RefreshAuthError) throw err;
     return fn(pick(await ctx.credentials({ force: true })));
   }
 }

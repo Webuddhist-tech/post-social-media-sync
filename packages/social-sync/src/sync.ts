@@ -3,13 +3,14 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { AccountService } from "./accounts.js";
 import { isPrivateBaseUrl, resolvePlatformKeys, type Config, type PlatformKeys } from "./config.js";
-import { pkceChallenge, randomToken, Secrets } from "./crypto.js";
+import { pkceChallenge, randomToken, safeEqual, Secrets, sha256Hex } from "./crypto.js";
 import { PostSyncEmitter } from "./events.js";
-import { AuthError, UserError } from "./http.js";
-import { consoleLogger, silentLogger, type Logger } from "./logger.js";
+import { ApiError, AuthError, RefreshAuthError, UserError } from "./http.js";
+import { consoleLogger, errorText, silentLogger, type Logger } from "./logger.js";
 import { hasFfmpeg, MediaStore, SUPPORTED_MIME_TYPES } from "./media.js";
 import { CONNECTORS, getConnector, getPlatform, PLATFORMS } from "./platforms/index.js";
 import { parsePostRequest, PostService } from "./posts.js";
+import type { Connector } from "./platforms/types.js";
 import type { Storage } from "./storage/types.js";
 import type {
   CheckResult,
@@ -75,6 +76,20 @@ export class ConnectError extends Error {
   }
 }
 
+/**
+ * What `connect.complete()` returns. "connected": the accounts were saved. "confirm": nothing tied the callback to the
+ * owner who started the login (no matching `binding`, no logged-in `ownerId`), so the code waits until that owner
+ * calls `connect.confirm(ownerId, confirmToken)` while logged in.
+ */
+export type ConnectCompletion =
+  | { status: "connected"; ownerId: string; accounts: PublicAccount[]; returnTo: string | null; connector: string }
+  | { status: "confirm"; confirmToken: string; returnTo: string | null; connector: string };
+
+/** How long a started login (and one waiting for confirmation) stays valid. */
+const LOGIN_TTL_MS = 30 * 60_000;
+/** Prefix of the oauth_states rows that hold a callback waiting for confirmation. */
+const CONFIRM_PREFIX = "confirm:";
+
 export interface MediaUpload {
   stream: Readable;
   filename: string;
@@ -117,11 +132,11 @@ export class PostSync {
     };
     this.enabled = new Set(options.enabledPlatforms ?? (Object.keys(PLATFORMS) as PlatformId[]));
     this.logger = options.logger === false ? silentLogger : (options.logger ?? consoleLogger);
-    this.events = new PostSyncEmitter((event, err) => this.logger.error(`listener for "${event}" failed`, err));
+    this.events = new PostSyncEmitter((event, err) => this.logger.error(`listener for "${event}" failed: ${errorText(err)}`, err));
     this.db = options.storage;
     this.secrets = new Secrets(options.secret);
     this.store = new MediaStore(this.db, this.config, this.secrets);
-    this.accountService = new AccountService(this.db, this.secrets, this.config, this.events);
+    this.accountService = new AccountService(this.db, this.secrets, this.config, this.events, this.logger);
     this.postService = new PostService(this.db, this.store, this.config, this.events, this.enabled);
     this.runner = new Worker({
       db: this.db,
@@ -209,7 +224,8 @@ export class PostSync {
         return { ok: true, detail };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (err instanceof AuthError) await this.accountService.markNeedsReconnect(row, message);
+        // A rejected refresh has flagged the account already.
+        if (err instanceof AuthError && !(err instanceof RefreshAuthError)) await this.accountService.markNeedsReconnect(row, message);
         return { ok: false, error: message, needsReconnect: err instanceof AuthError };
       }
     },
@@ -217,13 +233,35 @@ export class PostSync {
 
   // ---- connecting accounts --------------------------------------------------------------------
 
+  /** Exchanges an OAuth callback's code and saves the accounts for `ownerId`. */
+  private async exchangeLogin(
+    connector: Connector,
+    ownerId: string,
+    codeVerifier: string | null,
+    query: Record<string, string | undefined>,
+  ): Promise<PublicAccount[]> {
+    const drafts = await connector.exchangeCode!(this.config, {
+      code: query.code!,
+      redirectUri: this.redirectUri(connector.id),
+      codeVerifier,
+      query: Object.fromEntries(Object.entries(query).filter(([, v]) => typeof v === "string")) as Record<string, string>,
+    });
+    return this.accountService.saveDrafts(ownerId, connector.id, drafts.filter((d) => this.enabled.has(d.platform)));
+  }
+
   readonly connect = {
     /**
      * Starts an OAuth login. Send the user's browser to the returned `url`; the platform sends them back to
      * `<publicUrl>/oauth/<connector>/callback`, and the handler then redirects to `returnTo`.
      * `returnTo` is trusted as given here: validate it if it comes from a browser (the HTTP handler does).
+     * `binding` ties the login to the browser that starts it: pass the same value to `complete()` (the HTTP handler
+     * uses the SHA-256 hex of a random value it keeps in a cookie). Without it, `complete()` asks for confirmation.
      */
-    start: async (ownerId: string, connectorId: string, opts: { returnTo?: string | null } = {}): Promise<{ url: string }> => {
+    start: async (
+      ownerId: string,
+      connectorId: string,
+      opts: { returnTo?: string | null; binding?: string | null } = {},
+    ): Promise<{ url: string }> => {
       const connector = getConnector(connectorId);
       if (!connector || connector.kind !== "oauth" || !connector.platforms.some((p) => this.enabled.has(p))) {
         throw new UserError(`Unknown connector "${connectorId}".`);
@@ -237,6 +275,8 @@ export class PostSync {
         connector: connector.id,
         code_verifier: verifier,
         return_to: opts.returnTo ?? null,
+        binding: opts.binding || null,
+        callback_query: null,
         created_at: Date.now(),
       });
       const url = connector.authorizeUrl!(this.config, {
@@ -249,15 +289,20 @@ export class PostSync {
 
     /**
      * Finishes an OAuth login from the callback's query parameters. Validated by the single-use `state` created in
-     * `start()`, which also says which owner the accounts belong to.
+     * `start()`, which also says which owner the accounts belong to. The accounts are saved only when the callback
+     * comes from that owner: a `binding` equal to the one given to `start()`, or the logged-in `ownerId` (a different
+     * logged-in owner is refused). Otherwise the result is `{ status: "confirm", confirmToken }` and nothing is saved
+     * until the owner calls `confirm()`: a login link sent to someone else can't add their accounts to your owner.
      */
     complete: async (
       connectorId: string,
       query: Record<string, string | undefined>,
-    ): Promise<{ ownerId: string; accounts: PublicAccount[]; returnTo: string | null; connector: string }> => {
+      opts: { binding?: string | null; ownerId?: string | null } = {},
+    ): Promise<ConnectCompletion> => {
       const connector = getConnector(connectorId);
       if (!connector || connector.kind !== "oauth") throw new ConnectError(`Unknown connector "${connectorId}".`, null, connectorId);
-      const saved = query.state ? await this.db.takeOAuthState(query.state, Date.now() - 30 * 60_000) : undefined;
+      const valid = query.state && !query.state.startsWith(CONFIRM_PREFIX);
+      const saved = valid ? await this.db.takeOAuthState(query.state!, Date.now() - LOGIN_TTL_MS) : undefined;
       if (!saved || saved.connector !== connector.id) {
         throw new ConnectError("That login link expired or was already used. Please try connecting again.", saved?.return_to ?? null, connector.name);
       }
@@ -266,23 +311,57 @@ export class PostSync {
         throw new ConnectError(`${connector.name} login was cancelled or failed: ${reason}`, saved.return_to, connector.name);
       }
       if (!query.code) throw new ConnectError(`${connector.name} didn't return an authorization code.`, saved.return_to, connector.name);
-      try {
-        const drafts = await connector.exchangeCode!(this.config, {
-          code: query.code,
-          redirectUri: this.redirectUri(connector.id),
-          codeVerifier: saved.code_verifier,
-          query: Object.fromEntries(Object.entries(query).filter(([, v]) => typeof v === "string")) as Record<string, string>,
+      if (opts.ownerId && opts.ownerId !== saved.owner_id) {
+        throw new ConnectError("This login was started by a different user. Start it again from your account.", saved.return_to, connector.name);
+      }
+      const sameBrowser = !!saved.binding && !!opts.binding && safeEqual(saved.binding, opts.binding);
+      const verified = sameBrowser || (!!opts.ownerId && opts.ownerId === saved.owner_id);
+      if (!verified) {
+        // Keep the code (not exchanged yet) until the owner confirms it while logged in.
+        const confirmToken = randomToken();
+        await this.db.saveOAuthState({
+          state: CONFIRM_PREFIX + sha256Hex(confirmToken),
+          owner_id: saved.owner_id,
+          connector: connector.id,
+          code_verifier: saved.code_verifier,
+          return_to: saved.return_to,
+          binding: null,
+          callback_query: JSON.stringify(query),
+          created_at: Date.now(),
         });
-        const accounts = await this.accountService.saveDrafts(
-          saved.owner_id,
-          connector.id,
-          drafts.filter((d) => this.enabled.has(d.platform)),
-        );
-        return { ownerId: saved.owner_id, accounts, returnTo: saved.return_to, connector: connector.name };
+        return { status: "confirm", confirmToken, returnTo: saved.return_to, connector: connector.name };
+      }
+      try {
+        const accounts = await this.exchangeLogin(connector, saved.owner_id, saved.code_verifier, query);
+        return { status: "connected", ownerId: saved.owner_id, accounts, returnTo: saved.return_to, connector: connector.name };
       } catch (err) {
-        this.logger.error(`connecting ${connector.name} failed`, err);
+        this.logger.error(`connecting ${connector.name} failed: ${errorText(err)}`, err);
         const message = err instanceof Error ? err.message : String(err);
         throw new ConnectError(`Connecting ${connector.name} failed: ${message}`, saved.return_to, connector.name);
+      }
+    },
+
+    /**
+     * Finishes a login that `complete()` answered with status "confirm". Call it for the logged-in owner with the
+     * `confirmToken`. The token is single use and expires after 30 minutes; an owner other than the one who started
+     * the login gets a 403 UserError (and the token is used up).
+     */
+    confirm: async (ownerId: string, confirmToken: string): Promise<{ accounts: PublicAccount[]; connector: string; returnTo: string | null }> => {
+      const saved =
+        typeof confirmToken === "string" && confirmToken
+          ? await this.db.takeOAuthState(CONFIRM_PREFIX + sha256Hex(confirmToken), Date.now() - LOGIN_TTL_MS)
+          : undefined;
+      const connector = saved && getConnector(saved.connector);
+      if (!saved || !connector || !saved.callback_query) throw new UserError("That login expired or was already finished. Connect again.");
+      if (saved.owner_id !== ownerId) throw Object.assign(new UserError("This login was started by a different user."), { status: 403 });
+      try {
+        const accounts = await this.exchangeLogin(connector, saved.owner_id, saved.code_verifier, JSON.parse(saved.callback_query));
+        return { accounts, connector: connector.name, returnTo: saved.return_to };
+      } catch (err) {
+        this.logger.error(`connecting ${connector.name} failed: ${errorText(err)}`, err);
+        const message = `Connecting ${connector.name} failed: ${err instanceof Error ? err.message : String(err)}`;
+        // The platform failing is a bad gateway; anything else (e.g. a rejected code) is the request's problem.
+        throw Object.assign(new UserError(message), { status: err instanceof ApiError ? 502 : 400 });
       }
     },
 
@@ -337,14 +416,15 @@ export class PostSync {
       this.runner.kick();
       return post;
     },
-    list: (ownerId: string, opts?: { limit?: number; before?: number }): Promise<PostPage> => this.postService.list(ownerId, opts),
+    /** Newest first. Pass the previous page's `nextBefore` (an opaque cursor) as `before` for the next page. */
+    list: (ownerId: string, opts?: { limit?: number; before?: string | null }): Promise<PostPage> => this.postService.list(ownerId, opts),
     get: (ownerId: string, id: string): Promise<PublicPost | null> => this.postService.get(ownerId, id),
     /** Removes a post from the history (published posts stay online). */
     remove: (ownerId: string, id: string) => this.postService.remove(ownerId, id),
   };
 
   readonly targets = {
-    /** Queues a failed or cancelled publish job again. */
+    /** Queues a failed or cancelled publish job again (never one that has a remote post id: it was published). */
     retry: async (ownerId: string, id: string): Promise<boolean> => {
       const ok = await this.db.retryTarget(ownerId, id);
       if (ok) this.runner.kick();
@@ -368,6 +448,11 @@ export class PostSync {
     stop: (timeoutMs?: number) => this.runner.stop(timeoutMs),
     /** Runs all due jobs now and waits for them (for cron/serverless setups with `worker.autoStart: false`). */
     runDue: () => this.runner.runDue(),
+    /**
+     * Refreshes long-lived tokens, flags expired logins and deletes uploads no post uses, once. The started worker
+     * does this on its own; call it from your scheduler (e.g. hourly) when you use `runDue()` instead.
+     */
+    maintain: (): Promise<{ cleanedMedia: number }> => this.runner.maintain(),
     /** Waits until jobs running in this process are done. */
     idle: () => this.runner.idle(),
     isRunning: () => this.runner.isRunning,

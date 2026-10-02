@@ -45,6 +45,17 @@ export class AuthError extends Error {
   }
 }
 
+/**
+ * The platform rejected the saved login while refreshing it (or it expired and can't be refreshed). The account is
+ * already marked "needs reconnect": don't flag it again or force another refresh.
+ */
+export class RefreshAuthError extends AuthError {
+  constructor(message: string) {
+    super(message);
+    this.name = "RefreshAuthError";
+  }
+}
+
 export interface RequestOptions {
   method?: string;
   headers?: Record<string, string>;
@@ -59,6 +70,8 @@ export interface RequestOptions {
   timeoutMs?: number;
   /** Statuses that should not throw (besides 2xx). */
   okStatuses?: number[];
+  /** "manual": a 3xx answer is an error (without its body) instead of being followed. Default "follow". */
+  redirect?: RequestInit["redirect"];
 }
 
 export interface HttpResponse<T = any> {
@@ -196,11 +209,16 @@ export async function request<T = any>(url: string, opts: RequestOptions = {}): 
       headers,
       body,
       signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
+      ...(opts.redirect ? { redirect: opts.redirect } : {}),
     });
   } catch (err) {
     const host = new URL(target).host;
     const reason = err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err);
     throw new ApiError(`Network error talking to ${host}: ${reason}`, 0, null, true);
+  }
+  if (opts.redirect === "manual" && (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400))) {
+    await res.body?.cancel().catch(() => {});
+    throw new ApiError(`${new URL(target).host} answered with a redirect (${res.status}), which isn't followed.`, res.status, null, false);
   }
 
   let text: string;

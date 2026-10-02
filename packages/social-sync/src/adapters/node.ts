@@ -1,17 +1,44 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Http2ServerRequest, Http2ServerResponse } from "node:http2";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { UNMATCHED_HEADER, type PostSyncHandler, type RequestContext } from "../handler/index.js";
 
+/** A Node.js request: node:http, node:https or the node:http2 compatibility API (plus what frameworks attach). */
+export type NodeRequest = (IncomingMessage | Http2ServerRequest) & { originalUrl?: string; body?: unknown };
+/** A Node.js response: node:http, node:https or the node:http2 compatibility API. */
+export type NodeResponse = ServerResponse | Http2ServerResponse;
+
+function firstHeader(req: NodeRequest, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/** The scheme the client used: a proxy's X-Forwarded-Proto, HTTP/2's :scheme, else whether the socket is TLS. */
+function requestScheme(req: NodeRequest): "http" | "https" {
+  for (const raw of [firstHeader(req, "x-forwarded-proto")?.split(",")[0], firstHeader(req, ":scheme")]) {
+    const value = raw?.trim().toLowerCase();
+    if (value === "http" || value === "https") return value;
+  }
+  return (req.socket as any)?.encrypted ? "https" : "http";
+}
+
+/** Host (HTTP/1) or :authority (HTTP/2); "localhost" when it is missing or isn't a plain host[:port]. */
+function requestHost(req: NodeRequest): string {
+  const host = firstHeader(req, "host") ?? firstHeader(req, ":authority");
+  return host && !/[\s/\\?#@]/.test(host) && URL.canParse(`http://${host}`) ? host : "localhost";
+}
+
 /** Converts a Node.js request into a web Request (streams the body; reuses a body already parsed by middleware). */
-export function toWebRequest(req: IncomingMessage & { originalUrl?: string; body?: unknown }): Request {
-  const proto = (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0].trim() || ((req.socket as any)?.encrypted ? "https" : "http");
-  const host = req.headers.host ?? "localhost";
-  // Express rewrites req.url inside a mounted router; originalUrl keeps the full path.
-  const url = new URL(req.originalUrl ?? req.url ?? "/", `${proto}://${host}`);
+export function toWebRequest(req: NodeRequest): Request {
+  // Express rewrites req.url inside a mounted router; originalUrl keeps the full path. The target is appended, never
+  // resolved: "//evil.example/social/posts" must stay a path on this origin, not become a URL on another one.
+  const target = req.originalUrl ?? req.url ?? "/";
+  const url = `${requestScheme(req)}://${requestHost(req)}${target.startsWith("/") ? target : "/"}`;
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
-    if (value === undefined) continue;
+    // HTTP/2 pseudo-headers (:method, :path, :scheme, :authority) aren't valid header names.
+    if (value === undefined || key.startsWith(":")) continue;
     if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
     else headers.set(key, value);
   }
@@ -38,7 +65,7 @@ export function toWebRequest(req: IncomingMessage & { originalUrl?: string; body
  * which would drop the connection before the error response is sent. (Readable.toWeb does both, and can even throw
  * from a late "data" event after a cancel.)
  */
-function bodyStream(req: IncomingMessage): ReadableStream<Uint8Array> {
+function bodyStream(req: NodeRequest): ReadableStream<Uint8Array> {
   let started = false;
   let stopped = false;
   return new ReadableStream<Uint8Array>(
@@ -66,7 +93,7 @@ function bodyStream(req: IncomingMessage): ReadableStream<Uint8Array> {
 }
 
 /** Writes a web Response to a Node.js response. */
-export async function sendWebResponse(res: ServerResponse, response: Response): Promise<void> {
+export async function sendWebResponse(res: NodeResponse, response: Response): Promise<void> {
   res.statusCode = response.status;
   response.headers.forEach((value, key) => {
     if (key === UNMATCHED_HEADER) return;
@@ -90,14 +117,23 @@ export interface NodeHandlerOptions {
 }
 
 /**
- * A `(req, res, next?)` handler for Node's http server, Express, Connect, Koa (`ctx.req/ctx.res`) and NestJS.
- * Unknown paths call `next()` when given (so it can sit in a middleware chain), else answer 404.
+ * A `(req, res, next?)` handler for Node's http/https/http2 servers, Express, Connect, Koa (`ctx.req/ctx.res`) and
+ * NestJS. Unknown paths call `next()` when given (so it can sit in a middleware chain), else answer 404.
  */
 export function toNodeHandler(handler: PostSyncHandler, options: NodeHandlerOptions = {}) {
-  return async function postSyncNodeHandler(req: IncomingMessage & Record<string, any>, res: ServerResponse, next?: (err?: unknown) => void) {
+  return async function postSyncNodeHandler(req: NodeRequest & Record<string, any>, res: NodeResponse, next?: (err?: unknown) => void) {
+    let request: Request;
     try {
-      const context: RequestContext | undefined = options.authenticate ? { getOwnerId: () => options.authenticate!(req) } : undefined;
-      const response = await handler.fetch(toWebRequest(req), context);
+      request = toWebRequest(req);
+    } catch {
+      // Something a web Request can't carry (e.g. the TRACE method): not for this handler.
+      if (next) return next();
+      const headers = { "content-type": "application/json; charset=utf-8" };
+      return sendWebResponse(res, new Response(JSON.stringify({ error: "Bad request." }), { status: 400, headers }));
+    }
+    try {
+      const context: RequestContext | undefined = options.authenticate ? { getOwnerId: () => options.authenticate!(req as any) } : undefined;
+      const response = await handler.fetch(request, context);
       if (response.headers.has(UNMATCHED_HEADER) && next) {
         await response.body?.cancel().catch(() => {});
         return next();

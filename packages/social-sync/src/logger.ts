@@ -12,3 +12,12 @@ export const consoleLogger: Logger = {
 };
 
 export const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+/**
+ * An error as text for the log message itself. Loggers such as pino ignore a trailing Error argument, so error logs
+ * put this in the message and still pass the error as the extra argument.
+ */
+export function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  return String(err);
+}

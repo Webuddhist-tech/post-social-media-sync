@@ -23,6 +23,27 @@
     "express",
     "fastify"
   ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "sqlite": [
+        "./dist/storage/sqlite.d.ts"
+      ],
+      "postgres": [
+        "./dist/storage/postgres.d.ts"
+      ],
+      "express": [
+        "./dist/adapters/express.d.ts"
+      ],
+      "fastify": [
+        "./dist/adapters/fastify.d.ts"
+      ],
+      "client": [
+        "./dist/client/index.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
       "post-sync-source": "./src/index.ts",

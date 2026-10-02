@@ -16,7 +16,11 @@ export interface Storage {
   /** Insert or update by (owner_id, platform, external_id). Returns the account id. */
   upsertAccount(a: NewAccount): Promise<string>;
   updateAccountCredentials(id: string, credentials: string, expiresAt: number | null): Promise<void>;
-  setAccountStatus(id: string, status: AccountRow["status"], message: string | null): Promise<void>;
+  /**
+   * Sets the status and its message. Returns true when the status was different before (atomically: of several
+   * concurrent calls setting the same status, only one gets true), so "needs reconnect" is reported once.
+   */
+  setAccountStatus(id: string, status: AccountRow["status"], message: string | null): Promise<boolean>;
   deleteAccount(ownerId: string, id: string): Promise<boolean>;
   /** Accounts that share one login (same owner, connector and grant), e.g. a LinkedIn profile and its Pages. */
   accountsByGrant(ownerId: string, connector: string, grantId: string): Promise<AccountRow[]>;
@@ -38,8 +42,16 @@ export interface Storage {
   // posts and their per-account targets
   insertPost(post: PostRow, targets: TargetRow[]): Promise<void>;
   getPost(ownerId: string | null, id: string): Promise<PostRow | undefined>;
-  listPosts(ownerId: string, limit: number, before?: number): Promise<PostRow[]>;
-  deletePost(ownerId: string, id: string): Promise<boolean>;
+  /**
+   * Newest first (created_at DESC, id DESC). With `before`, only posts after that one in this order:
+   * `created_at < before.createdAt OR (created_at = before.createdAt AND id < before.id)`.
+   */
+  listPosts(ownerId: string, limit: number, before?: PostCursor): Promise<PostRow[]>;
+  /**
+   * Deletes a post with its targets, unless one of them is running. The check and the delete are atomic with
+   * respect to `claimDueTargets`, so a job can't start on a post that is being deleted.
+   */
+  deletePostIfIdle(ownerId: string, id: string): Promise<"deleted" | "running" | "not_found">;
   targetsForPosts(postIds: string[]): Promise<TargetRow[]>;
   getTarget(ownerId: string | null, id: string): Promise<TargetRow | undefined>;
   hasActiveTargetsForAccount(accountId: string): Promise<boolean>;
@@ -54,8 +66,12 @@ export interface Storage {
   renewLeases(ids: string[], leaseUntil: number): Promise<void>;
   setTargetProgress(id: string, progress: string): Promise<void>;
   completeTarget(id: string, remoteId: string, remoteUrl: string | null, note: string | null): Promise<void>;
-  /** Back to queued for a retry at `retryAt`, or failed for good when retryAt is null. */
-  failTarget(id: string, error: string, retryAt: number | null): Promise<void>;
+  /**
+   * Back to queued for a retry at `retryAt`, or failed for good when retryAt is null. Only touches a running target
+   * (never overwrites one that succeeded, was cancelled or was already failed elsewhere); returns whether it did.
+   */
+  failTarget(id: string, error: string, retryAt: number | null): Promise<boolean>;
+  /** Queues a failed or cancelled target again, unless it has a remote id (it was published). */
   retryTarget(ownerId: string, id: string): Promise<boolean>;
   cancelTarget(ownerId: string, id: string): Promise<boolean>;
   /** Running targets whose lease expired (their process died). Marks them failed and returns them. */
@@ -91,6 +107,10 @@ export interface OAuthStateRow {
   connector: string;
   code_verifier: string | null;
   return_to: string | null;
+  /** SHA-256 hex of a nonce kept in the starting browser's cookie (null: not bound to a browser). */
+  binding: string | null;
+  /** JSON of the callback's query parameters, kept while a login waits for its owner to confirm it. */
+  callback_query: string | null;
   created_at: number;
 }
 
@@ -107,6 +127,12 @@ export interface MediaRow {
   height: number | null;
   duration: number | null;
   created_at: number;
+}
+
+/** Where a page of posts ends. An empty `id` means "everything created before `createdAt`". */
+export interface PostCursor {
+  createdAt: number;
+  id: string;
 }
 
 export interface PostRow {
