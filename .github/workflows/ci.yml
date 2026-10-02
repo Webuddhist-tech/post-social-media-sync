@@ -13,9 +13,28 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install ffmpeg
+      - name: Install ffmpeg (media tests use it)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: npm ci
       - run: npm run typecheck
+      - name: Typecheck the example host app
+        run: npx tsc -p examples/express-host/tsconfig.json
       - run: npm test
       - run: npm run build
+      - name: Lint the OpenAPI document
+        run: npx --yes @redocly/cli@2 lint docs/openapi.yaml
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t post-sync:ci .
+      - name: Smoke test the image
+        run: |
+          docker run -d --name post-sync -p 3000:3000 -e ADMIN_PASSWORD=ci-password post-sync:ci
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:3000/healthz
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/accounts)" = 401
+      - name: Container logs
+        if: always()
+        run: docker logs post-sync || true

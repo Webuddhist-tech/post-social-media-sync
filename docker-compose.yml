@@ -1,12 +1,44 @@
+# Post Sync: the ready-to-run server (web dashboard, or headless API with DASHBOARD=off).
+#   cp .env.example .env    # set ADMIN_PASSWORD (or DASHBOARD=off + API_TOKEN) and PUBLIC_BASE_URL
+#   docker compose up -d --build
+# OAuth redirect URIs to register with the platforms: <PUBLIC_BASE_URL>/api/oauth/<connector>/callback
 services:
   postsync:
     build: .
+    image: post-sync
     restart: unless-stopped
+    init: true
     env_file: .env
+    environment:
+      # Fixed inside the container; change the host side of `ports` instead.
+      PORT: "3000"
+      DATA_DIR: /data
     ports:
       - "3000:3000"
     volumes:
-      - postsync-data:/data # database, uploads and the encryption key
+      - postsync-data:/data # SQLite database, uploaded media and the generated APP_SECRET
+    # With the optional PostgreSQL service below:
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+
+  # Optional: PostgreSQL instead of SQLite, e.g. to run extra API-only replicas with WORKER=off (they must share
+  # /data/media too). Uncomment this service, the depends_on above and the volume below, then set in .env:
+  #   DATABASE_URL=postgres://postsync:change-me@postgres:5432/postsync
+  # postgres:
+  #   image: postgres:17-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: postsync
+  #     POSTGRES_PASSWORD: change-me
+  #     POSTGRES_DB: postsync
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U postsync -d postsync"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 10
 
   # Optional: a free public HTTPS URL without opening ports (needed for Instagram photos / Threads media).
   # Run `docker compose --profile tunnel up`, then copy the https://….trycloudflare.com URL from the
@@ -20,3 +52,4 @@ services:
 
 volumes:
   postsync-data:
+  # postgres-data:

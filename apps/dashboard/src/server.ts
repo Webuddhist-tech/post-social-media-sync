@@ -67,6 +67,13 @@ export async function buildServer(opts: BuildOptions): Promise<FastifyInstance> 
     reply.raw.setHeader("Referrer-Policy", "same-origin");
   });
 
+  // Set before the routes: each route keeps the error handler that was in place when it was registered.
+  app.setErrorHandler((err: any, req, reply) => {
+    if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
+    req.log.error(err);
+    return reply.code(500).send({ error: "Internal server error" });
+  });
+
   app.get("/healthz", async () => ({ ok: true }));
 
   if (config.dashboard) {
@@ -113,12 +120,6 @@ export async function buildServer(opts: BuildOptions): Promise<FastifyInstance> 
     defaultReturnTo: `${config.siteUrl}/#accounts`,
     cors: config.corsOrigins.length ? { origins: config.corsOrigins, credentials: true } : undefined,
     allowRemoteMedia: config.remoteMediaHosts.length ? (url) => config.remoteMediaHosts.includes(url.hostname.toLowerCase()) : undefined,
-  });
-
-  app.setErrorHandler((err: any, req, reply) => {
-    if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
-    req.log.error(err);
-    return reply.code(500).send({ error: "Internal server error" });
   });
 
   app.addHook("onClose", async () => sync.close());

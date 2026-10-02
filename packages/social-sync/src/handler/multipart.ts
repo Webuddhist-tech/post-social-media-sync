@@ -30,13 +30,19 @@ export async function parseMultipart<T>(
     let chain: Promise<void> = Promise.resolve();
     let failed: unknown = null;
     const source = Readable.fromWeb(request.body as any);
+    const files: Readable[] = [];
 
     const abort = (err: unknown) => {
       if (failed) return;
       failed = err;
       source.unpipe(bb);
       source.destroy();
-      reject(err);
+      // Busboy never ends a file that was cut off: close it so `onFile` fails and removes what it wrote, then answer.
+      for (const file of files) if (!file.readableEnded) file.destroy();
+      chain.then(
+        () => reject(err),
+        () => reject(err),
+      );
     };
 
     bb.on("file", (_field, stream, info) => {
@@ -44,6 +50,7 @@ export async function parseMultipart<T>(
         stream.resume();
         return;
       }
+      files.push(stream);
       // Files are handled in order; each one is fully written before the next starts.
       chain = chain.then(async () => {
         if (failed) {

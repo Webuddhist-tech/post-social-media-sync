@@ -222,13 +222,18 @@ class SqliteStorage implements Storage {
   async claimDueTargets(limit: number, now: number, leaseUntil: number): Promise<TargetRow[]> {
     // BEGIN IMMEDIATE: take the write lock first, so two processes never claim from the same snapshot.
     return this.db.transaction(() => {
+      // Each account's oldest due target first, then the limit: one account's backlog can't crowd out the others.
       const rows = this.db
         .prepare(
-          `SELECT * FROM ${this.t.targets} t WHERE t.status = 'queued' AND t.run_at <= ?
-             AND NOT EXISTS (SELECT 1 FROM ${this.t.targets} r WHERE r.account_id = t.account_id AND r.status = 'running')
-           ORDER BY t.run_at LIMIT ?`,
+          `SELECT * FROM ${this.t.targets} WHERE id IN (
+             SELECT id FROM (
+               SELECT t.id, t.run_at, ROW_NUMBER() OVER (PARTITION BY t.account_id ORDER BY t.run_at, t.id) AS n FROM ${this.t.targets} t
+               WHERE t.status = 'queued' AND t.run_at <= ?
+                 AND NOT EXISTS (SELECT 1 FROM ${this.t.targets} r WHERE r.account_id = t.account_id AND r.status = 'running')
+             ) WHERE n = 1 ORDER BY run_at LIMIT ?
+           ) ORDER BY run_at`,
         )
-        .all(now, limit * 4) as TargetRow[];
+        .all(now, limit) as TargetRow[];
       const seen = new Set<string>();
       const picked: TargetRow[] = [];
       const claim = this.db.prepare(
@@ -239,7 +244,16 @@ class SqliteStorage implements Storage {
         if (seen.has(r.account_id)) continue;
         seen.add(r.account_id);
         if (claim.run(leaseUntil, now, now, r.id).changes === 0) continue;
-        picked.push({ ...r, status: "running", attempts: r.attempts + 1, lease_until: leaseUntil, started_at: now, progress: "Starting…", error: null });
+        picked.push({
+          ...r,
+          status: "running",
+          attempts: r.attempts + 1,
+          lease_until: leaseUntil,
+          started_at: now,
+          progress: "Starting…",
+          error: null,
+          updated_at: now,
+        });
         if (picked.length >= limit) break;
       }
       return picked;
@@ -314,7 +328,8 @@ class SqliteStorage implements Storage {
         `UPDATE ${this.t.targets} SET status = 'failed', error = ?, progress = NULL, lease_until = NULL, finished_at = ?, updated_at = ? WHERE id = ?`,
       );
       for (const r of rows) upd.run(message, now, now, r.id);
-      return rows.map((r) => ({ ...r, status: "failed" as const, error: message, progress: null, lease_until: null, finished_at: now }));
+      const failed = { status: "failed" as const, error: message, progress: null, lease_until: null, finished_at: now, updated_at: now };
+      return rows.map((r) => ({ ...r, ...failed }));
     }).immediate();
   }
 }

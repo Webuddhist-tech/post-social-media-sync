@@ -17,6 +17,8 @@ export interface TableNames {
 export function schemaSql(t: TableNames, dialect: "sqlite" | "postgres"): string {
   const int = dialect === "postgres" ? "BIGINT" : "INTEGER";
   const real = dialect === "postgres" ? "DOUBLE PRECISION" : "REAL";
+  // Index names can't be schema-qualified (Postgres puts an index in its table's schema).
+  const ix = (table: string, suffix: string) => `${table.slice(table.lastIndexOf(".") + 1)}_${suffix}`;
   return `
 CREATE TABLE IF NOT EXISTS ${t.accounts} (
   id TEXT PRIMARY KEY,
@@ -37,7 +39,7 @@ CREATE TABLE IF NOT EXISTS ${t.accounts} (
   updated_at ${int} NOT NULL,
   UNIQUE (owner_id, platform, external_id)
 );
-CREATE INDEX IF NOT EXISTS ${t.accounts}_owner ON ${t.accounts} (owner_id);
+CREATE INDEX IF NOT EXISTS ${ix(t.accounts, "owner")} ON ${t.accounts} (owner_id);
 
 CREATE TABLE IF NOT EXISTS ${t.states} (
   state TEXT PRIMARY KEY,
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS ${t.media} (
   duration ${real},
   created_at ${int} NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ${t.media}_owner ON ${t.media} (owner_id);
+CREATE INDEX IF NOT EXISTS ${ix(t.media, "owner")} ON ${t.media} (owner_id);
 
 CREATE TABLE IF NOT EXISTS ${t.posts} (
   id TEXT PRIMARY KEY,
@@ -72,7 +74,7 @@ CREATE TABLE IF NOT EXISTS ${t.posts} (
   scheduled_at ${int},
   created_at ${int} NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ${t.posts}_owner_created ON ${t.posts} (owner_id, created_at);
+CREATE INDEX IF NOT EXISTS ${ix(t.posts, "owner_created")} ON ${t.posts} (owner_id, created_at);
 
 CREATE TABLE IF NOT EXISTS ${t.postMedia} (
   post_id TEXT NOT NULL REFERENCES ${t.posts}(id) ON DELETE CASCADE,
@@ -80,7 +82,7 @@ CREATE TABLE IF NOT EXISTS ${t.postMedia} (
   position ${int} NOT NULL,
   PRIMARY KEY (post_id, media_id)
 );
-CREATE INDEX IF NOT EXISTS ${t.postMedia}_media ON ${t.postMedia} (media_id);
+CREATE INDEX IF NOT EXISTS ${ix(t.postMedia, "media")} ON ${t.postMedia} (media_id);
 
 CREATE TABLE IF NOT EXISTS ${t.targets} (
   id TEXT PRIMARY KEY,
@@ -104,10 +106,10 @@ CREATE TABLE IF NOT EXISTS ${t.targets} (
   created_at ${int} NOT NULL,
   updated_at ${int} NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ${t.targets}_due ON ${t.targets} (status, run_at);
-CREATE INDEX IF NOT EXISTS ${t.targets}_post ON ${t.targets} (post_id);
-CREATE INDEX IF NOT EXISTS ${t.targets}_account ON ${t.targets} (account_id, status);
+CREATE INDEX IF NOT EXISTS ${ix(t.targets, "due")} ON ${t.targets} (status, run_at);
+CREATE INDEX IF NOT EXISTS ${ix(t.targets, "post")} ON ${t.targets} (post_id);
+CREATE INDEX IF NOT EXISTS ${ix(t.targets, "account")} ON ${t.targets} (account_id, status);
 -- At most one running job per account, across every process sharing the database.
-CREATE UNIQUE INDEX IF NOT EXISTS ${t.targets}_one_running ON ${t.targets} (account_id) WHERE status = 'running';
+CREATE UNIQUE INDEX IF NOT EXISTS ${ix(t.targets, "one_running")} ON ${t.targets} (account_id) WHERE status = 'running';
 `;
 }

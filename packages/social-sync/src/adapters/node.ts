@@ -26,10 +26,43 @@ export function toWebRequest(req: IncomingMessage & { originalUrl?: string; body
       headers.delete("content-length");
       if (typeof req.body === "object" && !Buffer.isBuffer(req.body)) headers.set("content-type", "application/json");
     } else {
-      body = Readable.toWeb(req) as unknown as ReadableStream;
+      body = bodyStream(req);
     }
   }
   return new Request(url, { method, headers, body, duplex: "half" } as RequestInit);
+}
+
+/**
+ * The request body as a web stream that reads only when the handler asks for it, so a request the handler doesn't
+ * match is left untouched for the next middleware. Cancelling discards the rest instead of destroying the request,
+ * which would drop the connection before the error response is sent. (Readable.toWeb does both, and can even throw
+ * from a late "data" event after a cancel.)
+ */
+function bodyStream(req: IncomingMessage): ReadableStream<Uint8Array> {
+  let started = false;
+  let stopped = false;
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (!started) {
+          started = true;
+          req.on("data", (chunk: Buffer) => {
+            if (stopped) return;
+            controller.enqueue(new Uint8Array(chunk));
+            if ((controller.desiredSize ?? 0) <= 0) req.pause();
+          });
+          req.once("end", () => !stopped && controller.close());
+          req.once("error", (err) => !stopped && controller.error(err));
+        }
+        req.resume();
+      },
+      cancel() {
+        stopped = true;
+        req.resume();
+      },
+    },
+    { highWaterMark: 0 },
+  );
 }
 
 /** Writes a web Response to a Node.js response. */

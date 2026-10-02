@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Acme Blog · social publishing</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --card: #fff;
+        --text: #1d2330;
+        --muted: #677084;
+        --line: #dde1e8;
+        --accent: #2f6fed;
+        --ok: #1f8a4c;
+        --bad: #c4352b;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; background: var(--card); border-bottom: 1px solid var(--line); }
+      header h1 { font-size: 18px; margin: 0; }
+      main { max-width: 860px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+      section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+      section h2 { font-size: 16px; margin: 0 0 10px; }
+      .muted { color: var(--muted); font-size: 13px; }
+      .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+      .list > * { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); }
+      .list > *:first-child { border-top: 0; }
+      .grow { flex: 1; min-width: 0; }
+      input, textarea, button, select { font: inherit; }
+      input[type="text"], input[type="password"], input[type="url"], input[type="datetime-local"], textarea { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; }
+      textarea { width: 100%; min-height: 90px; resize: vertical; }
+      button, a.button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text); cursor: pointer; text-decoration: none; }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .notice { padding: 10px 12px; border-radius: 8px; background: #e9f0ff; }
+      .notice.error { background: #fde9e7; color: var(--bad); }
+      .status { font-size: 12px; padding: 2px 7px; border-radius: 99px; background: #eef0f4; }
+      .status.succeeded, .status.active { background: #e3f5ea; color: var(--ok); }
+      .status.failed, .status.needs_reauth { background: #fde9e7; color: var(--bad); }
+      .thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+      .thumb { position: relative; width: 84px; height: 84px; border-radius: 6px; overflow: hidden; background: #eef0f4; font-size: 11px; display: grid; place-items: center; text-align: center; }
+      .thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .thumb button { position: absolute; top: 2px; right: 2px; padding: 0 6px; }
+      form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      ul.issues { margin: 8px 0 0; padding-left: 18px; color: var(--bad); }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Acme Blog <span class="muted">· an existing app with social publishing added</span></h1>
+      <div id="user"></div>
+    </header>
+
+    <main>
+      <div id="notice" class="notice" hidden></div>
+
+      <section id="login" hidden>
+        <h2>Log in (demo)</h2>
+        <p class="muted">This stands in for your app's real login. Each name is a separate user with their own accounts and posts.</p>
+        <form class="inline" id="login-form">
+          <input type="text" name="name" placeholder="alice" required maxlength="32" autocomplete="username" />
+          <button class="primary">Log in</button>
+        </form>
+      </section>
+
+      <div id="app" hidden>
+        <section>
+          <h2>Connected accounts</h2>
+          <div id="accounts" class="list"></div>
+        </section>
+
+        <section>
+          <h2>Connect an account</h2>
+          <div id="connectors" class="list"></div>
+        </section>
+
+        <section>
+          <h2>New post</h2>
+          <textarea id="text" placeholder="What do you want to share?"></textarea>
+          <div class="thumbs" id="media"></div>
+          <div class="row">
+            <label class="button"><input type="file" id="files" multiple accept="image/*,video/*" /></label>
+          </div>
+          <p class="muted">Post to:</p>
+          <div id="targets" class="row"></div>
+          <div class="row" style="margin-top: 10px">
+            <label>Schedule <input type="datetime-local" id="schedule" /></label>
+            <span class="grow"></span>
+            <button id="validate">Check</button>
+            <button id="publish" class="primary">Publish</button>
+          </div>
+          <ul class="issues" id="issues"></ul>
+        </section>
+
+        <section>
+          <h2>Share an article</h2>
+          <p class="muted">Calls a route of this app (<code>POST /api/articles/:slug/share</code>) that creates the post on the server with <code>sync.posts.create()</code>.</p>
+          <div id="articles" class="list"></div>
+        </section>
+
+        <section>
+          <h2>History</h2>
+          <div id="posts" class="list"></div>
+          <button id="more" hidden>Load more</button>
+        </section>
+      </div>
+    </main>
+
+    <script type="module">
+      // Uses the Post Sync HTTP API mounted at /social directly with fetch. With a bundler you could use
+      // createPostSyncClient({ baseUrl: "/social" }) from "post-social-media-sync/client" instead.
+      const API = "/social";
+      const $ = (id) => document.getElementById(id);
+
+      /** Tiny element builder: strings become text nodes, so user content is never parsed as HTML. */
+      function h(tag, attrs = {}, ...children) {
+        const el = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs)) {
+          if (v === undefined || v === null || v === false) continue;
+          if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+          else if (v === true) el.setAttribute(k, "");
+          else el.setAttribute(k, v);
+        }
+        for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) el.append(c instanceof Node ? c : String(c));
+        return el;
+      }
+
+      async function call(method, path, body) {
+        const res = await fetch(path, {
+          method,
+          headers: body === undefined ? {} : { "content-type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw Object.assign(new Error(data?.error ?? `Request failed (${res.status})`), { status: res.status, issues: data?.issues });
+        return data;
+      }
+
+      function notice(message, isError = false) {
+        const el = $("notice");
+        el.textContent = message;
+        el.className = isError ? "notice error" : "notice";
+        el.hidden = !message;
+      }
+      const guard = (fn) => async (...args) => {
+        try {
+          await fn(...args);
+        } catch (err) {
+          notice(err.message, true);
+        }
+      };
+
+      const state = { user: null, description: null, accounts: [], media: [], posts: [], nextBefore: null };
+      const platformName = (id) => state.description?.platforms.find((p) => p.id === id)?.name ?? id;
+      const when = (ms) => (ms ? new Date(ms).toLocaleString() : "");
+
+      // ---- session (the host app's own routes) ----
+
+      async function loadSession() {
+        state.user = (await call("GET", "/me")).user;
+        $("login").hidden = !!state.user;
+        $("app").hidden = !state.user;
+        $("user").replaceChildren(
+          state.user ? h("span", {}, `Signed in as ${state.user} `, h("button", { onclick: guard(logout) }, "Log out")) : "",
+        );
+        if (state.user) await Promise.all([loadDescription(), loadAccounts(), loadArticles(), loadPosts()]);
+      }
+
+      $("login-form").addEventListener(
+        "submit",
+        guard(async (e) => {
+          e.preventDefault();
+          await call("POST", "/login", { name: new FormData(e.target).get("name") });
+          notice("");
+          await loadSession();
+        }),
+      );
+
+      async function logout() {
+        await call("POST", "/logout");
+        Object.assign(state, { accounts: [], media: [], posts: [] });
+        await loadSession();
+      }
+
+      // ---- accounts & connecting ----
+
+      async function loadDescription() {
+        state.description = await call("GET", `${API}/platforms`);
+        $("connectors").replaceChildren(...state.description.connectors.map(connectorRow));
+      }
+
+      function connectorRow(c) {
+        const label = h("strong", { class: "grow" }, c.name);
+        if (c.kind === "credentials") {
+          const form = h(
+            "form",
+            { class: "inline" },
+            ...c.credentialFields.map((f) => h("input", { type: f.type, name: f.key, placeholder: f.placeholder ?? f.label, title: f.help, required: f.required })),
+            h("button", { class: "primary" }, "Connect"),
+          );
+          form.addEventListener(
+            "submit",
+            guard(async (e) => {
+              e.preventDefault();
+              const fields = Object.fromEntries([...new FormData(form)].filter(([, v]) => v !== ""));
+              const { accounts } = await call("POST", `${API}/connect/${c.id}/credentials`, { fields });
+              form.reset();
+              notice(`Connected ${accounts.map((a) => a.name).join(", ")}.`);
+              await loadAccounts();
+            }),
+          );
+          return h("div", {}, label, form);
+        }
+        // OAuth: a plain link works because the login cookie travels with the navigation.
+        // The platform sends the browser back to returnTo with ?postsync=connected|error&connector=...
+        return h(
+          "div",
+          {},
+          label,
+          c.configured
+            ? h("a", { class: "button", href: `${API}/connect/${c.id}?returnTo=${encodeURIComponent("/")}` }, "Connect")
+            : h("span", { class: "muted" }, "App keys not set. Redirect URI: ", h("code", {}, c.redirectUri)),
+        );
+      }
+
+      async function loadAccounts() {
+        state.accounts = (await call("GET", `${API}/accounts`)).accounts;
+        $("accounts").replaceChildren(
+          ...(state.accounts.length ? state.accounts.map(accountRow) : [h("p", { class: "muted" }, "No accounts yet. Connect one below.")]),
+        );
+        $("targets").replaceChildren(
+          ...state.accounts
+            .filter((a) => a.status === "active")
+            .map((a) => h("label", {}, h("input", { type: "checkbox", value: a.id, checked: true }), ` ${a.name} (${platformName(a.platform)})`)),
+        );
+      }
+
+      function accountRow(a) {
+        return h(
+          "div",
+          {},
+          a.avatarUrl ? h("img", { src: a.avatarUrl, alt: "", width: 28, height: 28, style: "border-radius:50%" }) : null,
+          h("span", { class: "grow" }, h("strong", {}, a.name), " ", h("span", { class: "muted" }, platformName(a.platform), a.username ? ` · @${a.username}` : "")),
+          h("span", { class: `status ${a.status}`, title: a.statusMessage ?? "" }, a.status === "active" ? "active" : "reconnect"),
+          h(
+            "button",
+            {
+              onclick: guard(async () => {
+                const r = await call("POST", `${API}/accounts/${a.id}/check`);
+                notice(r.ok ? `${a.name}: ${r.detail ?? "works"}` : `${a.name}: ${r.error}`, !r.ok);
+                await loadAccounts();
+              }),
+            },
+            "Check",
+          ),
+          h(
+            "button",
+            {
+              onclick: guard(async () => {
+                if (!confirm(`Disconnect ${a.name}?`)) return;
+                await call("DELETE", `${API}/accounts/${a.id}`);
+                await loadAccounts();
+              }),
+            },
+            "Disconnect",
+          ),
+        );
+      }
+
+      // ---- composing ----
+
+      $("files").addEventListener(
+        "change",
+        guard(async (e) => {
+          const form = new FormData();
+          for (const file of e.target.files) form.append("file", file);
+          e.target.value = "";
+          notice("Uploading…");
+          const res = await fetch(`${API}/media`, { method: "POST", body: form });
+          const data = await res.json().catch(() => null);
+          if (!res.ok) throw new Error(data?.error ?? `Upload failed (${res.status})`);
+          state.media.push(...data.media);
+          notice("");
+          renderMedia();
+        }),
+      );
+
+      function renderMedia() {
+        $("media").replaceChildren(
+          ...state.media.map((m) =>
+            h(
+              "div",
+              { class: "thumb", title: m.filename },
+              m.thumbnailUrl ? h("img", { src: m.thumbnailUrl, alt: m.filename }) : m.filename,
+              h(
+                "button",
+                {
+                  title: "Remove",
+                  onclick: guard(async () => {
+                    await call("DELETE", `${API}/media/${m.id}`);
+                    state.media = state.media.filter((x) => x.id !== m.id);
+                    renderMedia();
+                  }),
+                },
+                "×",
+              ),
+            ),
+          ),
+        );
+      }
+
+      function postRequest() {
+        const schedule = $("schedule").value;
+        return {
+          text: $("text").value,
+          mediaIds: state.media.map((m) => m.id),
+          targets: [...$("targets").querySelectorAll("input:checked")].map((i) => ({ accountId: i.value })),
+          scheduledAt: schedule ? new Date(schedule).toISOString() : null,
+        };
+      }
+
+      function showIssues(issues = []) {
+        $("issues").replaceChildren(...issues.filter((i) => i.errors.length).map((i) => h("li", {}, `${i.accountName} (${platformName(i.platform)}): ${i.errors.join(" ")}`)));
+      }
+
+      $("validate").addEventListener(
+        "click",
+        guard(async () => {
+          const { issues } = await call("POST", `${API}/posts/validate`, postRequest());
+          showIssues(issues);
+          notice(issues.some((i) => i.errors.length) ? "Some accounts can't take this post yet." : "Looks good for every account.");
+        }),
+      );
+
+      $("publish").addEventListener("click", async () => {
+        try {
+          await call("POST", `${API}/posts`, postRequest());
+          Object.assign(state, { media: [] });
+          $("text").value = "";
+          $("schedule").value = "";
+          renderMedia();
+          showIssues();
+          notice("Queued. Watch the progress in History.");
+          await loadPosts();
+        } catch (err) {
+          showIssues(err.issues);
+          notice(err.issues ? "Some accounts can't take this post." : err.message, true);
+        }
+      });
+
+      // ---- the host app's own publishing route ----
+
+      async function loadArticles() {
+        const { articles } = await call("GET", "/api/articles");
+        $("articles").replaceChildren(
+          ...articles.map((a) =>
+            h(
+              "div",
+              {},
+              h("span", { class: "grow" }, a.title, " ", h("span", { class: "muted" }, a.url)),
+              h(
+                "button",
+                {
+                  onclick: guard(async () => {
+                    await call("POST", `/api/articles/${a.slug}/share`);
+                    notice(`Sharing "${a.title}" to every connected account.`);
+                    await loadPosts();
+                  }),
+                },
+                "Share everywhere",
+              ),
+            ),
+          ),
+        );
+      }
+
+      // ---- history ----
+
+      async function loadPosts(more = false) {
+        const page = await call("GET", `${API}/posts?limit=10${more && state.nextBefore ? `&before=${state.nextBefore}` : ""}`);
+        state.posts = more ? [...state.posts, ...page.posts] : page.posts;
+        state.nextBefore = page.nextBefore;
+        $("more").hidden = !page.nextBefore;
+        $("posts").replaceChildren(...(state.posts.length ? state.posts.map(postRow) : [h("p", { class: "muted" }, "Nothing posted yet.")]));
+      }
+      $("more").addEventListener("click", guard(() => loadPosts(true)));
+
+      function postRow(p) {
+        return h(
+          "div",
+          { style: "display:block" },
+          h(
+            "div",
+            { class: "row" },
+            h("span", { class: "grow" }, h("strong", {}, p.text.slice(0, 120) || "(no caption)"), " ", h("span", { class: "muted" }, when(p.createdAt), p.scheduledAt ? ` · scheduled for ${when(p.scheduledAt)}` : "")),
+            h(
+              "button",
+              {
+                onclick: guard(async () => {
+                  await call("DELETE", `${API}/posts/${p.id}`);
+                  await loadPosts();
+                }),
+              },
+              "Remove",
+            ),
+          ),
+          ...p.targets.map((t) =>
+            h(
+              "div",
+              { class: "row", style: "margin:6px 0 0 12px" },
+              h("span", { class: `status ${t.status}` }, t.status),
+              h("span", { class: "grow" }, `${t.accountName} (${platformName(t.platform)})`, " ", h("span", { class: "muted" }, t.error ?? t.progress ?? "")),
+              t.remoteUrl ? h("a", { href: t.remoteUrl, target: "_blank", rel: "noopener" }, "View") : null,
+              t.status === "failed" || t.status === "cancelled" ? h("button", { onclick: guard(() => targetAction(t, "retry")) }, "Retry") : null,
+              t.status === "queued" ? h("button", { onclick: guard(() => targetAction(t, "cancel")) }, "Cancel") : null,
+            ),
+          ),
+        );
+      }
+
+      async function targetAction(t, action) {
+        await call("POST", `${API}/targets/${t.id}/${action}`);
+        await loadPosts();
+      }
+
+      // Refresh while something is publishing.
+      setInterval(() => {
+        const busy = state.posts.some((p) => p.targets.some((t) => t.status === "running" || (t.status === "queued" && t.runAt <= Date.now())));
+        if (state.user && busy) loadPosts().catch(() => {});
+      }, 3000);
+
+      // ---- back from an OAuth login: ?postsync=connected&connector=...&count=... or ?postsync=error&error=... ----
+
+      const q = new URLSearchParams(location.search);
+      if (q.get("postsync") === "connected") notice(`Connected ${q.get("count")} account(s) on ${q.get("connector")}.`);
+      else if (q.get("postsync") === "error") notice(q.get("error") ?? "Connecting failed.", true);
+      if (q.has("postsync")) history.replaceState(null, "", location.pathname);
+
+      loadSession().catch((err) => notice(err.message, true));
+    </script>
+  </body>
+</html>

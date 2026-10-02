@@ -107,6 +107,8 @@ export function createPostSyncClient(options: PostSyncClientOptions) {
     if (opts.onProgress && XHR && !options.fetch) {
       const h = await headers();
       return new Promise((resolve, reject) => {
+        // An abort before this point (e.g. while `headers()` ran) fires no event the listener below could catch.
+        if (opts.signal?.aborted) return reject(new PostSyncClientError("Upload cancelled.", 0));
         const xhr = new XHR();
         xhr.open("POST", `${base}/media`);
         xhr.withCredentials = credentials === "include";
@@ -163,7 +165,7 @@ export function createPostSyncClient(options: PostSyncClientOptions) {
         const { url } = await call<{ url: string }>("POST", `/connect/${enc(connector)}`, { returnTo: opts.returnTo });
         (globalThis as any).location.assign(url);
       },
-      /** Connects a form-based platform (Bluesky: `{ identifier, password }`). */
+      /** Connects a form-based platform (Bluesky: `{ identifier, appPassword, service? }`). */
       withCredentials: async (connector: ConnectorId | string, fields: Record<string, string>) =>
         (await call<{ accounts: PublicAccount[] }>("POST", `/connect/${enc(connector)}/credentials`, { fields })).accounts,
       /**
@@ -194,7 +196,7 @@ export function createPostSyncClient(options: PostSyncClientOptions) {
     },
 
     posts: {
-      /** Checks the post against every selected account's rules. An empty list means it's good to go. */
+      /** Checks the post against every selected account's rules: one entry per account, fine when its `errors` is empty. */
       validate: async (req: PostRequest) => (await call<{ issues: TargetIssue[] }>("POST", "/posts/validate", req)).issues,
       /** Creates the post and queues publishing (now, or at `scheduledAt`). Throws with `issues` if it's invalid. */
       create: async (req: PostRequest) => (await call<{ post: PublicPost }>("POST", "/posts", req)).post,

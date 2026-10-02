@@ -96,7 +96,12 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
   function resolveReturnTo(raw: unknown): string {
     if (raw === undefined || raw === null || raw === "") return defaultReturnTo;
     if (typeof raw !== "string") throw new UserError("`returnTo` must be a URL.");
-    if (raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\")) return new URL(raw, publicUrl.origin).toString();
+    if (raw.startsWith("/") && !raw.startsWith("//") && !raw.startsWith("/\\")) {
+      // The URL parser drops tabs and newlines ("/\t/evil.com" is "//evil.com"): check where the path really leads.
+      const local = URL.canParse(raw, publicUrl.origin) ? new URL(raw, publicUrl.origin) : null;
+      if (local?.origin === publicUrl.origin) return local.toString();
+      throw new UserError("`returnTo` must be an absolute URL or a path starting with /.");
+    }
     let u: URL;
     try {
       u = new URL(raw);
@@ -205,12 +210,12 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
   // SPA / token auth: POST /connect/meta { returnTo } → { url }; then set window.location to it.
   add("POST", "/connect/:connector", true, async ({ request, ownerId, params }) => {
     const body = await readJson(request);
-    return json(await sync.connect.start(ownerId, params.connector, { returnTo: resolveReturnTo(body.returnTo) }));
+    return json(await sync.connect.start(ownerId, params.connector, { returnTo: resolveReturnTo(body?.returnTo) }));
   });
 
   add("POST", "/connect/:connector/credentials", true, async ({ request, ownerId, params }) => {
     const body = await readJson(request);
-    const fields = body.fields && typeof body.fields === "object" ? body.fields : {};
+    const fields = body?.fields && typeof body.fields === "object" ? body.fields : {};
     return json({ accounts: await sync.connect.withCredentials(ownerId, params.connector, fields) }, 201);
   });
 

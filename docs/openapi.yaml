@@ -1,0 +1,1768 @@
+openapi: 3.1.0
+info:
+  title: Post Sync HTTP API
+  version: 0.2.0
+  summary: Publish one post to Instagram, Facebook, TikTok, YouTube, LinkedIn, Threads, X and Bluesky.
+  description: |
+    The HTTP API served by `createHandler()` from the `post-social-media-sync` package (and by its Express and Fastify
+    adapters), plus the few extra routes of the ready-made Post Sync server (`apps/dashboard`).
+
+    **Paths are relative to where the handler is mounted**: the path of the engine's `publicUrl`. An app that calls
+    `createPostSync({ publicUrl: "https://api.example.com/social" })` serves `GET https://api.example.com/social/accounts`.
+    The ready-made server mounts it at `<PUBLIC_BASE_URL>/api`.
+
+    **Who is calling.** Every route except the OAuth callback and the signed media files belongs to one *owner*: the
+    user or workspace id returned by the `authenticate` hook you pass to the handler. Owners never see each other's
+    accounts, media or posts. When you embed the package, authentication is whatever your hook checks (your session
+    cookie, a JWT, ...): the security schemes below describe the ready-made server only.
+    A missing owner answers `401`; a 4xx error thrown by the hook (such as the ready-made server's `400` for a malformed
+    `X-Owner-Id`) is passed through with its status.
+
+    **Conventions**
+    - Bodies are JSON (`Content-Type: application/json`, 1 MB max by default, `413` above), except uploads
+      (`multipart/form-data`).
+    - Errors are `{ "error": "message" }`; creating or validating a post adds `issues` (per-account problems).
+    - Times are epoch milliseconds. Ids are opaque strings (UUIDs).
+    - Every `GET` route also answers `HEAD`.
+    - `POST` and `DELETE` requests whose browser `Origin` header is not `publicUrl`'s origin, an allowed redirect origin,
+      a CORS origin or the request's own origin are refused with `403` (cross-site request forgery protection; requests
+      without an `Origin` header, e.g. from servers, are not affected). Can be turned off with `checkOrigin: false`.
+    - With the `cors` option, `OPTIONS` preflight requests answer `204` with the CORS headers.
+    - An error from a platform's API answers `502`; an unexpected server error `500`.
+    - A path the handler doesn't know answers `404 { "error": "Not found" }` with the header `x-post-sync-unmatched: 1`
+      (the Express and Node adapters call `next()` instead, so your app's other routes keep working). A path with
+      invalid percent-encoding answers `400`.
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: "{publicUrl}"
+    description: Where the handler is mounted (the engine's `publicUrl`).
+    variables:
+      publicUrl:
+        default: http://localhost:3000/api
+        description: >-
+          `<PUBLIC_BASE_URL>/api` for the ready-made server; your own `publicUrl` (e.g. https://api.example.com/social)
+          when you embed the package.
+
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+
+tags:
+  - name: Platforms
+    description: What the server supports and which platforms are set up (to build your UI).
+  - name: Accounts
+    description: Connected social accounts of the calling owner.
+  - name: Connect
+    description: >-
+      Connecting accounts: OAuth logins (Meta, Threads, TikTok, LinkedIn, Google/YouTube, X) and form-based logins
+      (Bluesky).
+  - name: Media
+    description: Uploaded photos and videos.
+  - name: Posts
+    description: Posts and their per-account publish jobs.
+  - name: Targets
+    description: >-
+      A target is one post on one account (a publish job). It runs in the background worker, is retried on temporary
+      errors, and reports progress.
+  - name: Public
+    description: >-
+      Routes without login: the OAuth redirect URI and the signed media URLs that platforms (and browsers) download
+      from.
+  - name: Dashboard server
+    description: >-
+      Routes that exist **only in the ready-made Post Sync server** (`apps/dashboard`), next to the API. They are not
+      part of the package's handler; when you embed the package, your own app handles login and configuration.
+  - name: Webhooks
+    description: |
+      Events the ready-made server POSTs to `WEBHOOK_URL` (see the `webhooks` section), for backends not written in
+      Node.js. When you embed the package, subscribe with `sync.on(...)` / `sync.events.onAny(...)` instead.
+
+      - Which events: `WEBHOOK_EVENTS` (comma-separated); default every event except the frequent `target.progress`.
+      - Body: `{ "id", "event", "data", "createdAt" }`, where `data` is the event's payload.
+      - Answer with any 2xx within 10 seconds. Redirects are not followed. Network errors, timeouts, 3xx, 408, 429 and
+        5xx are retried, up to 4 attempts in total (after 1 s, 4 s and 16 s); other 4xx answers are not retried.
+        Retries keep the delivery id and body but get a new timestamp and signature.
+      - With `WEBHOOK_SECRET` set, verify `X-Post-Sync-Signature` (HMAC-SHA256 of `<timestamp>.<raw body>`) and
+        reject old timestamps.
+
+paths:
+  # ---- public ---------------------------------------------------------------------------------------------------
+
+  /oauth/{connector}/callback:
+    get:
+      tags: [Public]
+      operationId: oauthCallback
+      summary: OAuth redirect URI
+      description: |
+        Register `<publicUrl>/oauth/<connector>/callback` as the redirect URI in each platform's developer console (also
+        listed as `redirectUri` in `GET /platforms`). The platform sends the browser here after the login; the server
+        saves the accounts for the owner who started the login and redirects the browser back to the `returnTo` given
+        when the login started (or the default page), with the result in the query string:
+
+        - success: `?postsync=connected&connector=<connector name>&count=<number of accounts connected>`
+        - failure: `?postsync=error&connector=<connector name>&error=<message>`
+
+        The single-use `state` parameter (valid for 30 minutes) identifies the login, so no session is needed.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/Connector"
+        - name: state
+          in: query
+          description: The state created by `/connect/{connector}`.
+          schema: { type: string }
+        - name: code
+          in: query
+          description: Authorization code from the platform.
+          schema: { type: string }
+        - name: error
+          in: query
+          description: Set by the platform when the login was cancelled or failed (also `error_reason`, `error_description`).
+          schema: { type: string }
+      responses:
+        "302":
+          description: Back to the `returnTo` page with `postsync`, `connector` and `count` or `error` added to its query.
+          headers:
+            Location:
+              $ref: "#/components/headers/ConnectResultLocation"
+
+  /media/{sig}/{file}:
+    parameters:
+      - name: sig
+        in: path
+        required: true
+        description: Signature that makes the URL unguessable.
+        schema: { type: string }
+      - name: file
+        in: path
+        required: true
+        description: Stored file name.
+        schema: { type: string, examples: ["0b6d6f9e-5d7a-4a53-9b0b-3c9f7a7d2b10.mp4"] }
+      - name: Range
+        in: header
+        required: false
+        description: A single byte range (`bytes=0-1023`, `bytes=1024-`, `bytes=-500`).
+        schema: { type: string }
+    get:
+      tags: [Public]
+      operationId: getMediaFile
+      summary: Download a media file
+      description: >-
+        The `url` and `thumbnailUrl` of uploaded media. Public on purpose: Instagram, Threads and TikTok download
+        files from here, so `publicUrl` must be reachable from the internet for them. Supports byte ranges (video
+        players).
+      security: []
+      responses:
+        "200":
+          $ref: "#/components/responses/MediaFile"
+        "206":
+          description: The requested byte range.
+          headers:
+            Content-Range:
+              description: "`bytes <start>-<end>/<size>`"
+              schema: { type: string }
+            Content-Length: { $ref: "#/components/headers/ContentLength" }
+            Accept-Ranges: { $ref: "#/components/headers/AcceptRanges" }
+            Cache-Control: { $ref: "#/components/headers/MediaCacheControl" }
+          content:
+            image/*: {}
+            video/*: {}
+        "404":
+          description: Unknown file or wrong signature.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: Not found }
+        "416":
+          description: The range is outside the file.
+          headers:
+            Content-Range:
+              description: "`bytes */<size>`"
+              schema: { type: string }
+    head:
+      tags: [Public]
+      operationId: headMediaFile
+      summary: Media file headers
+      security: []
+      responses:
+        "200":
+          description: Headers only.
+          headers:
+            Content-Length: { $ref: "#/components/headers/ContentLength" }
+            Accept-Ranges: { $ref: "#/components/headers/AcceptRanges" }
+        "206":
+          description: Headers for the requested range.
+        "404":
+          description: Unknown file or wrong signature.
+        "416":
+          description: The range is outside the file.
+
+  # ---- platforms ----------------------------------------------------------------------------------------------
+
+  /platforms:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    get:
+      tags: [Platforms]
+      operationId: describe
+      summary: Platforms, options, limits and setup state
+      description: >-
+        Everything a composer UI needs: each platform's capabilities (caption length, media limits) and options, and
+        each connector's login kind, whether its app keys are set, and the redirect URI to register.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Description" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ---- accounts -------------------------------------------------------------------------------------------------
+
+  /accounts:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    get:
+      tags: [Accounts]
+      operationId: listAccounts
+      summary: List connected accounts
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accounts]
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/PublicAccount" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /accounts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/AccountId"
+    get:
+      tags: [Accounts]
+      operationId: getAccount
+      summary: Get an account
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account]
+                properties:
+                  account: { $ref: "#/components/schemas/PublicAccount" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Accounts]
+      operationId: removeAccount
+      summary: Disconnect an account
+      description: Deletes the saved login. Refused while the account has queued or running posts.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The account has queued or running posts. Cancel them first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /accounts/{id}/check:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/AccountId"
+    post:
+      tags: [Accounts]
+      operationId: checkAccount
+      summary: Test the saved login
+      description: >-
+        Checks that the saved login still works, without posting anything. A login the platform rejects marks the
+        account `needs_reauth` (and `ok: false, needsReconnect: true` is returned); a working one marks it `active`.
+      responses:
+        "200":
+          description: The result of the check (also when the login doesn't work).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---- connect --------------------------------------------------------------------------------------------------
+
+  /connect/{connector}:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/Connector"
+    get:
+      tags: [Connect]
+      operationId: connectRedirect
+      summary: Start an OAuth login (browser navigation)
+      description: |
+        For cookie-based logins: link or navigate the browser here (`<a href="/social/connect/meta?returnTo=/settings">`).
+        It redirects to the platform's login page; afterwards the OAuth callback sends the browser back to `returnTo`
+        with the result in its query string.
+
+        If the connector is unknown or its app keys aren't set, the browser is sent straight back to `returnTo` with
+        `?postsync=error&connector=<connector id>&error=<message>`.
+
+        With token auth (an `Authorization` header a navigation can't carry), use `POST /connect/{connector}` instead.
+      parameters:
+        - $ref: "#/components/parameters/ReturnTo"
+      responses:
+        "302":
+          description: To the platform's login page, or back to `returnTo` with `postsync=error`.
+          headers:
+            Location:
+              description: The platform's authorization URL, or `returnTo` with the error added.
+              schema: { type: string, format: uri }
+        "400":
+          description: "`returnTo` is not a path or an allowed origin."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Connect]
+      operationId: connectStart
+      summary: Start an OAuth login (returns the URL)
+      description: >-
+        For single-page apps and token auth: returns the platform's login URL. Send the browser there
+        (`window.location.assign(url)`); afterwards it comes back to `returnTo` with the result in the query string
+        (see the OAuth callback).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                returnTo:
+                  $ref: "#/components/schemas/ReturnTo"
+            example: { returnTo: "https://app.example.com/settings/social" }
+      responses:
+        "200":
+          description: The platform's login URL.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url: { type: string, format: uri }
+        "400":
+          description: Unknown connector, its app keys aren't set, `returnTo` isn't allowed, or the body isn't JSON.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+
+  /connect/{connector}/credentials:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/Connector"
+    post:
+      tags: [Connect]
+      operationId: connectWithCredentials
+      summary: Connect with a form (Bluesky)
+      description: >-
+        For connectors of kind `credentials`: send the values of the connector's `credentialFields` (from
+        `GET /platforms`). Bluesky takes `identifier` (handle or email), `appPassword` (an app password, not the main
+        password) and optionally `service` (the PDS URL, default https://bsky.social).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fields]
+              properties:
+                fields:
+                  type: object
+                  additionalProperties: { type: string }
+            example:
+              fields: { identifier: you.bsky.social, appPassword: xxxx-xxxx-xxxx-xxxx }
+      responses:
+        "201":
+          description: The connected (or updated) accounts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accounts]
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/PublicAccount" }
+        "400":
+          description: Unknown connector, missing fields, the platform rejected the login, or the body isn't JSON.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "502": { $ref: "#/components/responses/PlatformError" }
+
+  # ---- media ----------------------------------------------------------------------------------------------------
+
+  /media:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    post:
+      tags: [Media]
+      operationId: uploadMedia
+      summary: Upload files
+      description: >-
+        Streams up to 20 files to the server (any field name). Each file may be up to the server's upload limit
+        (`maxUploadMb` in `GET /platforms`, 4096 MB by default). Supported types are listed in `supportedMimeTypes`.
+        With ffmpeg on the server, videos are probed for size and duration and get a poster frame.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: array
+                  maxItems: 20
+                  items:
+                    type: string
+                    contentMediaType: application/octet-stream
+            encoding:
+              file:
+                contentType: image/jpeg, image/png, image/webp, image/gif, video/mp4, video/quicktime, video/webm, video/x-m4v
+      responses:
+        "201":
+          description: The stored files, in upload order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [media]
+                properties:
+                  media:
+                    type: array
+                    items: { $ref: "#/components/schemas/PublicMedia" }
+        "400":
+          description: >-
+            Not multipart, no files, more than 20 files, a file over the upload limit, or an unsupported file type.
+            Files of the request stored before the error stay as unused uploads, which are deleted after a day.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+
+  /media/from-url:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    post:
+      tags: [Media]
+      operationId: importMedia
+      summary: Import a file from a URL
+      description: >-
+        Makes the server download a file (e.g. from your own bucket). Disabled unless the server allows the URL
+        (handler option `allowRemoteMedia`; `REMOTE_MEDIA_HOSTS` in the ready-made server). Redirects are followed
+        (at most 5) and must stay on allowed URLs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+                filename:
+                  type: string
+                  description: File name to store (default from the URL).
+            example: { url: "https://cdn.example.com/uploads/clip.mp4" }
+      responses:
+        "201":
+          description: The stored file.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [media]
+                properties:
+                  media: { $ref: "#/components/schemas/PublicMedia" }
+        "400":
+          description: Not an absolute http(s) URL, the download failed or was too large, or an unsupported file type.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            Importing from URLs isn't enabled, the URL (or a redirect) isn't allowed, or a cross-origin browser
+            request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "502":
+          description: The remote server couldn't be reached.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /media/{id}:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/MediaId"
+    get:
+      tags: [Media]
+      operationId: getMedia
+      summary: Get an uploaded file's details
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [media]
+                properties:
+                  media: { $ref: "#/components/schemas/PublicMedia" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Media]
+      operationId: removeMedia
+      summary: Delete an upload
+      description: Uploads that no post uses are also deleted automatically after a day.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: A post uses this file. Remove the post first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---- posts ----------------------------------------------------------------------------------------------------
+
+  /posts/validate:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    post:
+      tags: [Posts]
+      operationId: validatePost
+      summary: Check a post without creating it
+      description: >-
+        Checks the post against every selected account's rules (caption length as each platform counts it, media
+        types and counts, platform options, reachability of the media URL, accounts needing reconnection). Returns one
+        entry per account; the post is good to go when every `errors` list is empty.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostRequest" }
+      responses:
+        "200":
+          description: One entry per selected account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [issues]
+                properties:
+                  issues:
+                    type: array
+                    items: { $ref: "#/components/schemas/TargetIssue" }
+        "400":
+          description: >-
+            Malformed request, no account selected, or an unknown account, platform or media id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+
+  /posts:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    post:
+      tags: [Posts]
+      operationId: createPost
+      summary: Create a post
+      description: >-
+        Validates the post (as `/posts/validate`) and queues one publish job (target) per account: now, or at
+        `scheduledAt`. Publishing happens in the background; follow it with `GET /posts/{id}` (or events/webhooks).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostRequest" }
+            examples:
+              everywhere:
+                summary: Every connected Bluesky and LinkedIn account, now
+                value:
+                  text: "We just launched our new website! https://example.com"
+                  platforms: [bluesky, linkedin]
+              scheduled:
+                summary: Chosen accounts, scheduled, with media and options
+                value:
+                  text: Behind the scenes of our launch
+                  title: Launch day
+                  mediaIds: ["0b6d6f9e-5d7a-4a53-9b0b-3c9f7a7d2b10"]
+                  targets:
+                    - accountId: 5f0e7a52-3c1d-4b8e-9a3f-2d6c1b0e9f11
+                    - accountId: 8c2d4e6f-1a3b-4c5d-9e7f-0a1b2c3d4e5f
+                      text: Shorter caption for this account
+                  platformOptions:
+                    youtube: { privacyStatus: unlisted }
+                    tiktok: { privacyLevel: SELF_ONLY }
+                  scheduledAt: "2026-11-01T09:00:00Z"
+      responses:
+        "201":
+          description: The created post with its queued targets.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [post]
+                properties:
+                  post: { $ref: "#/components/schemas/PublicPost" }
+        "400":
+          description: >-
+            Malformed request, unknown account/platform/media, a scheduled time in the past, or some accounts can't
+            take this post (then `issues` lists the problems per account).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: "Some accounts can't take this post:\nMy Page (instagram): Instagram needs a photo or video."
+                issues:
+                  - accountId: 5f0e7a52-3c1d-4b8e-9a3f-2d6c1b0e9f11
+                    accountName: My Page
+                    platform: instagram
+                    errors: [Instagram needs a photo or video.]
+                    length: 42
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+    get:
+      tags: [Posts]
+      operationId: listPosts
+      summary: Post history (newest first)
+      parameters:
+        - name: limit
+          in: query
+          description: Page size (1-100).
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: before
+          in: query
+          description: "`nextBefore` from the previous page (epoch ms). Invalid values are ignored."
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PostPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /posts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/PostId"
+    get:
+      tags: [Posts]
+      operationId: getPost
+      summary: Get a post and the status of each target
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [post]
+                properties:
+                  post: { $ref: "#/components/schemas/PublicPost" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Posts]
+      operationId: removePost
+      summary: Remove a post from the history
+      description: >-
+        Its queued targets are dropped with it, and media only this post used is deleted. What was already published
+        stays online on the platforms. Refused while a target is running.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: This post is still publishing. Wait for it to finish.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---- targets --------------------------------------------------------------------------------------------------
+
+  /targets/{id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/TargetId"
+    post:
+      tags: [Targets]
+      operationId: retryTarget
+      summary: Queue a failed or cancelled target again
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "409":
+          description: The target isn't failed or cancelled (or doesn't exist).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /targets/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+      - $ref: "#/components/parameters/TargetId"
+    post:
+      tags: [Targets]
+      operationId: cancelTarget
+      summary: Cancel a queued or scheduled target
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/CrossOrigin" }
+        "409":
+          description: The target isn't queued (it is already running or finished, or doesn't exist).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---- ready-made server only -----------------------------------------------------------------------------------
+
+  /login:
+    post:
+      tags: [Dashboard server]
+      operationId: dashboardLogin
+      summary: Log in to the dashboard (DASHBOARD=on only)
+      description: >-
+        Checks `ADMIN_PASSWORD` and sets the `pss_session` cookie (HttpOnly, SameSite=Lax, 30 days). The session acts
+        as the owner `default`. After 5 wrong passwords from one IP, logins from it are refused for 15 minutes.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        "200":
+          description: Logged in.
+          headers:
+            Set-Cookie:
+              description: "`pss_session=<expiry>.<signature>; Path=/; HttpOnly; SameSite=Lax` (+ `Secure` on https)"
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+        "401":
+          description: Wrong password.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: Wrong password. }
+        "429":
+          description: Too many failed attempts.
+          headers:
+            Retry-After:
+              description: Seconds until logins are accepted again.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /logout:
+    post:
+      tags: [Dashboard server]
+      operationId: dashboardLogout
+      summary: Log out of the dashboard (DASHBOARD=on only)
+      security: []
+      responses:
+        "200":
+          description: The session cookie is cleared.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+
+  /session:
+    get:
+      tags: [Dashboard server]
+      operationId: dashboardSession
+      summary: Whether the browser has a dashboard session (DASHBOARD=on only)
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authenticated]
+                properties:
+                  authenticated: { type: boolean }
+
+  /meta:
+    parameters:
+      - $ref: "#/components/parameters/OwnerId"
+    get:
+      tags: [Dashboard server]
+      operationId: dashboardMeta
+      summary: Description plus setup hints for the dashboard
+      description: >-
+        Same as `GET /platforms`, plus the server's `PUBLIC_BASE_URL` and, per connector, the environment variables
+        that enable it. Available with DASHBOARD on or off.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Description"
+                  - type: object
+                    required: [publicBaseUrl, connectors]
+                    properties:
+                      publicBaseUrl:
+                        type: string
+                        format: uri
+                        description: "`PUBLIC_BASE_URL` (the API lives under `<publicBaseUrl>/api`)."
+                      connectors:
+                        type: array
+                        items:
+                          allOf:
+                            - $ref: "#/components/schemas/ConnectorDescription"
+                            - type: object
+                              required: [envVars]
+                              properties:
+                                envVars:
+                                  type: array
+                                  items: { type: string }
+                                  examples: [[META_APP_ID, META_APP_SECRET]]
+        "400":
+          description: Malformed `X-Owner-Id` header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /healthz:
+    servers:
+      - url: "{siteUrl}"
+        description: The ready-made server's root (`PUBLIC_BASE_URL`), not under /api.
+        variables:
+          siteUrl:
+            default: http://localhost:3000
+    get:
+      tags: [Dashboard server]
+      operationId: healthz
+      summary: Health check (ready-made server, at the server root)
+      security: []
+      responses:
+        "200":
+          description: The server is up.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+
+webhooks:
+  # Sent by the ready-made server to WEBHOOK_URL. Delivery and signature rules: see the Webhooks tag.
+  post.created:
+    post:
+      tags: [Webhooks]
+      operationId: onPostCreated
+      summary: "A post was created (one target per account was queued)"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostCreatedEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  target.started:
+    post:
+      tags: [Webhooks]
+      operationId: onTargetStarted
+      summary: "Publishing to one account started"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TargetStartedEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  target.progress:
+    post:
+      tags: [Webhooks]
+      operationId: onTargetProgress
+      summary: "Progress while publishing (only sent when listed in WEBHOOK_EVENTS)"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TargetProgressEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  target.succeeded:
+    post:
+      tags: [Webhooks]
+      operationId: onTargetSucceeded
+      summary: "Published to one account (`remoteUrl` links to the post)"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TargetSucceededEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  target.failed:
+    post:
+      tags: [Webhooks]
+      operationId: onTargetFailed
+      summary: "Publishing to one account failed (`willRetry` says whether it is retried)"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TargetFailedEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  target.cancelled:
+    post:
+      tags: [Webhooks]
+      operationId: onTargetCancelled
+      summary: "A queued target was cancelled"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TargetCancelledEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  account.connected:
+    post:
+      tags: [Webhooks]
+      operationId: onAccountConnected
+      summary: "Accounts were connected (or reconnected)"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AccountConnectedEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  account.disconnected:
+    post:
+      tags: [Webhooks]
+      operationId: onAccountDisconnected
+      summary: "An account was disconnected"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AccountDisconnectedEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+  account.needsReconnect:
+    post:
+      tags: [Webhooks]
+      operationId: onAccountNeedsReconnect
+      summary: "An account's login stopped working; the user must connect it again"
+      parameters:
+        - $ref: "#/components/parameters/WebhookEvent"
+        - $ref: "#/components/parameters/WebhookDelivery"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AccountNeedsReconnectEvent" }
+      responses:
+        "2XX": { $ref: "#/components/responses/WebhookDelivered" }
+        default: { $ref: "#/components/responses/WebhookNotDelivered" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Ready-made server: `Authorization: Bearer <API_TOKEN>`. Acts for the owner `default` (the dashboard's data), or
+        for any owner named in the `X-Owner-Id` header, so one backend can serve all its users. A wrong token answers
+        401 (it doesn't fall back to the cookie). When you embed the package, your `authenticate` hook decides.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: pss_session
+      description: >-
+        Ready-made server with DASHBOARD=on: the session cookie set by `POST /login`. Acts as the owner `default`.
+        When you embed the package, use your own session instead.
+
+  parameters:
+    OwnerId:
+      name: X-Owner-Id
+      in: header
+      required: false
+      description: >-
+        Ready-made server with bearer auth only: the owner (your user or workspace id) to act for. Default `default`.
+        A value not matching the pattern answers 400. Ignored for cookie sessions. Not part of the package: embedders
+        identify the owner in their `authenticate` hook.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._:@|-]{1,200}$"
+        examples: [user_42]
+    Connector:
+      name: connector
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/ConnectorId" }
+    AccountId:
+      name: id
+      in: path
+      required: true
+      description: Account id.
+      schema: { type: string }
+    MediaId:
+      name: id
+      in: path
+      required: true
+      description: Media id.
+      schema: { type: string }
+    PostId:
+      name: id
+      in: path
+      required: true
+      description: Post id.
+      schema: { type: string }
+    TargetId:
+      name: id
+      in: path
+      required: true
+      description: Target id (from a post's `targets`).
+      schema: { type: string }
+    ReturnTo:
+      name: returnTo
+      in: query
+      required: false
+      schema: { $ref: "#/components/schemas/ReturnTo" }
+    WebhookEvent:
+      name: X-Post-Sync-Event
+      in: header
+      required: true
+      description: The event name (same as `event` in the body).
+      schema: { $ref: "#/components/schemas/EventName" }
+    WebhookDelivery:
+      name: X-Post-Sync-Delivery
+      in: header
+      required: true
+      description: Unique id of this delivery (same as `id` in the body; the same on retries). Use it to ignore duplicates.
+      schema: { type: string, format: uuid }
+    WebhookTimestamp:
+      name: X-Post-Sync-Timestamp
+      in: header
+      required: true
+      description: Unix time in seconds when this attempt was sent. Reject old ones (e.g. older than 5 minutes) to stop replays.
+      schema: { type: string, pattern: "^[0-9]+$" }
+    WebhookSignature:
+      name: X-Post-Sync-Signature
+      in: header
+      required: false
+      description: |
+        Sent when `WEBHOOK_SECRET` is set: `sha256=` + hex HMAC-SHA256 of `<X-Post-Sync-Timestamp>.<raw request body>`
+        with the secret as key. Recompute it over the raw body and compare in constant time:
+
+        ```js
+        const expected = "sha256=" + crypto.createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex");
+        const ok = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature)); // check lengths first
+        ```
+      schema: { type: string, pattern: "^sha256=[0-9a-f]{64}$" }
+
+  headers:
+    ConnectResultLocation:
+      description: >-
+        `returnTo` (or the default page) plus `postsync=connected&connector=<name>&count=<n>`, or
+        `postsync=error&connector=<name>&error=<message>`.
+      schema: { type: string, format: uri }
+      examples:
+        connected:
+          value: "https://app.example.com/settings?postsync=connected&connector=Facebook+%26+Instagram&count=2"
+        error:
+          value: "https://app.example.com/settings?postsync=error&connector=TikTok&error=TikTok+login+was+cancelled+or+failed%3A+access_denied"
+    ContentLength:
+      schema: { type: integer }
+    AcceptRanges:
+      schema: { type: string, const: bytes }
+    MediaCacheControl:
+      schema: { type: string, examples: ["public, max-age=86400"] }
+
+  responses:
+    Ok:
+      description: Done.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Ok" }
+    Unauthorized:
+      description: Not logged in (the `authenticate` hook returned no owner).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Not logged in. }
+    CrossOrigin:
+      description: A browser request from a foreign `Origin` (cross-site request forgery protection).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Cross-origin request blocked. }
+    NotFound:
+      description: Not found (or belongs to another owner).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooLarge:
+      description: The JSON body is larger than `maxJsonBytes` (1 MB by default).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: Request body too large. }
+    PlatformError:
+      description: The platform's API failed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    WebhookDelivered:
+      description: Delivered.
+    WebhookNotDelivered:
+      description: Not delivered. 408, 429 and 5xx are retried; other 4xx are not.
+    MediaFile:
+      description: The file.
+      headers:
+        Content-Length: { $ref: "#/components/headers/ContentLength" }
+        Accept-Ranges: { $ref: "#/components/headers/AcceptRanges" }
+        Cache-Control: { $ref: "#/components/headers/MediaCacheControl" }
+      content:
+        image/*: {}
+        video/*: {}
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A message you can show to the user.
+        issues:
+          type: array
+          description: Per-account problems (creating a post).
+          items: { $ref: "#/components/schemas/TargetIssue" }
+
+    Ok:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean, const: true }
+
+    ReturnTo:
+      type: string
+      description: >-
+        Where to send the browser after the login: a path on `publicUrl`'s origin (`/settings`) or an absolute URL on
+        an allowed origin (handler option `allowedRedirectOrigins`; `ALLOWED_RETURN_ORIGINS` in the ready-made server).
+        Default: the handler's `defaultReturnTo`.
+      examples: [/settings/social]
+
+    PlatformId:
+      type: string
+      enum: [facebook, instagram, threads, tiktok, linkedin, youtube, x, bluesky]
+
+    ConnectorId:
+      type: string
+      description: >-
+        A login that connects one or more platforms: `meta` (Facebook Pages + Instagram), `threads`, `tiktok`,
+        `linkedin`, `google` (YouTube), `x`, `bluesky`.
+      enum: [meta, threads, tiktok, linkedin, google, x, bluesky]
+
+    TargetStatus:
+      type: string
+      description: "`queued` also covers scheduled targets and targets waiting for a retry (see `runAt`)."
+      enum: [queued, running, succeeded, failed, cancelled]
+
+    Capabilities:
+      type: object
+      required: [textOnly, maxTextLength, maxImages, video, mixedMedia, needsPublicMediaUrl, usesTitle]
+      properties:
+        textOnly:
+          type: boolean
+          description: Whether a post with no media is allowed.
+        maxTextLength:
+          type: integer
+          description: Max caption length (as the platform counts characters).
+        maxImages:
+          type: integer
+          description: Max number of images in one post (0 = images not supported).
+        video:
+          type: boolean
+          description: Whether a (single) video is supported.
+        mixedMedia:
+          type: boolean
+          description: Whether images and videos can be mixed in one post.
+        maxMediaItems:
+          type: integer
+          description: Max number of media items when mixing is allowed.
+        needsPublicMediaUrl:
+          type: [boolean, string]
+          enum: [false, images, all]
+          description: Which media the platform downloads from the public media URL (so it must be reachable from the internet).
+        usesTitle:
+          type: boolean
+          description: Whether the post title is used.
+
+    OptionField:
+      type: object
+      required: [key, label, type]
+      properties:
+        key: { type: string }
+        label: { type: string }
+        type:
+          type: string
+          enum: [select, checkbox, text]
+        choices:
+          type: array
+          items:
+            type: object
+            required: [value, label]
+            properties:
+              value: { type: string }
+              label: { type: string }
+        default:
+          type: [string, boolean]
+        help: { type: string }
+        remember:
+          type: boolean
+          description: false = a UI must not remember this choice for the next post (e.g. TikTok privacy, per TikTok's rules).
+
+    CredentialField:
+      type: object
+      required: [key, label, type]
+      properties:
+        key: { type: string }
+        label: { type: string }
+        type:
+          type: string
+          enum: [text, password, url]
+        placeholder: { type: string }
+        help: { type: string }
+        required: { type: boolean }
+
+    PlatformDescription:
+      type: object
+      required: [id, name, connector, capabilities, options]
+      properties:
+        id: { $ref: "#/components/schemas/PlatformId" }
+        name: { type: string, examples: [Instagram] }
+        connector: { $ref: "#/components/schemas/ConnectorId" }
+        capabilities: { $ref: "#/components/schemas/Capabilities" }
+        options:
+          type: array
+          description: Per-post options (send their values in `platformOptions` or `targets[].options`).
+          items: { $ref: "#/components/schemas/OptionField" }
+
+    ConnectorDescription:
+      type: object
+      required: [id, name, platforms, kind, configured, redirectUri, developerPortal, credentialFields]
+      properties:
+        id: { $ref: "#/components/schemas/ConnectorId" }
+        name: { type: string, examples: [Facebook & Instagram] }
+        platforms:
+          type: array
+          items: { $ref: "#/components/schemas/PlatformId" }
+        kind:
+          type: string
+          enum: [oauth, credentials]
+          description: "`oauth`: send the user to the platform; `credentials`: collect `credentialFields` in your UI."
+        configured:
+          type: boolean
+          description: Whether the app keys for this platform are set.
+        redirectUri:
+          type: [string, "null"]
+          format: uri
+          description: Redirect URI to register in the platform's developer console (OAuth connectors).
+        developerPortal:
+          type: [string, "null"]
+          format: uri
+        credentialFields:
+          type: [array, "null"]
+          items: { $ref: "#/components/schemas/CredentialField" }
+
+    Description:
+      type: object
+      required: [publicUrl, publicMediaReachable, ffmpeg, maxUploadMb, supportedMimeTypes, platforms, connectors]
+      properties:
+        publicUrl:
+          type: string
+          format: uri
+          description: Public base URL of the handler (OAuth callbacks and media URLs live under it).
+        publicMediaReachable:
+          type: boolean
+          description: False when publicUrl is a private address; Instagram photos and Threads media can't be fetched then.
+        ffmpeg:
+          type: boolean
+          description: Whether ffmpeg/ffprobe are installed on the server.
+        maxUploadMb: { type: integer }
+        supportedMimeTypes:
+          type: array
+          items: { type: string }
+          examples: [[image/jpeg, image/png, image/webp, image/gif, video/mp4, video/quicktime, video/webm, video/x-m4v]]
+        platforms:
+          type: array
+          items: { $ref: "#/components/schemas/PlatformDescription" }
+        connectors:
+          type: array
+          items: { $ref: "#/components/schemas/ConnectorDescription" }
+
+    PublicAccount:
+      type: object
+      required: [id, ownerId, platform, connector, name, username, avatarUrl, status, statusMessage, expiresAt, createdAt]
+      properties:
+        id: { type: string }
+        ownerId: { type: string }
+        platform: { $ref: "#/components/schemas/PlatformId" }
+        connector: { $ref: "#/components/schemas/ConnectorId" }
+        name: { type: string }
+        username: { type: [string, "null"] }
+        avatarUrl: { type: [string, "null"], format: uri }
+        status:
+          type: string
+          enum: [active, needs_reauth]
+          description: "`needs_reauth`: the login stopped working; connect the account again."
+        statusMessage: { type: [string, "null"] }
+        expiresAt:
+          type: [integer, "null"]
+          description: When the saved login expires, if the platform says (epoch ms).
+        createdAt: { type: integer }
+
+    PublicMedia:
+      type: object
+      required: [id, ownerId, filename, kind, mime, size, width, height, duration, url, thumbnailUrl, createdAt]
+      properties:
+        id: { type: string }
+        ownerId: { type: string }
+        filename: { type: string }
+        kind:
+          type: string
+          enum: [image, video]
+        mime: { type: string, examples: [video/mp4] }
+        size:
+          type: integer
+          description: Bytes.
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+        duration:
+          type: [number, "null"]
+          description: Seconds (videos).
+        url:
+          type: string
+          format: uri
+          description: "Signed URL of the file (`<publicUrl>/media/<sig>/<file>`), public on purpose: some platforms download from it."
+        thumbnailUrl:
+          type: [string, "null"]
+          format: uri
+          description: The image itself, or a video's poster frame when ffmpeg is available.
+        createdAt: { type: integer }
+
+    PublicTarget:
+      type: object
+      required:
+        - id
+        - postId
+        - ownerId
+        - accountId
+        - accountName
+        - platform
+        - status
+        - attempts
+        - runAt
+        - progress
+        - error
+        - remoteId
+        - remoteUrl
+        - textOverride
+        - startedAt
+        - finishedAt
+      properties:
+        id: { type: string }
+        postId: { type: string }
+        ownerId: { type: string }
+        accountId: { type: string }
+        accountName: { type: string }
+        platform: { $ref: "#/components/schemas/PlatformId" }
+        status: { $ref: "#/components/schemas/TargetStatus" }
+        attempts: { type: integer }
+        runAt:
+          type: integer
+          description: "When it runs (or ran): the scheduled time, or the next retry."
+        progress:
+          type: [string, "null"]
+          description: Live progress while running; extra info (e.g. "processing on YouTube") after success.
+        error: { type: [string, "null"] }
+        remoteId:
+          type: [string, "null"]
+          description: The post's id on the platform.
+        remoteUrl:
+          type: [string, "null"]
+          format: uri
+          description: Link to the published post.
+        textOverride: { type: [string, "null"] }
+        startedAt: { type: [integer, "null"] }
+        finishedAt: { type: [integer, "null"] }
+
+    PostMedia:
+      type: object
+      required: [id, kind, filename, url, thumbnailUrl]
+      properties:
+        id: { type: string }
+        kind:
+          type: string
+          enum: [image, video, missing]
+          description: "`missing`: the file was deleted."
+        filename: { type: string }
+        url: { type: [string, "null"], format: uri }
+        thumbnailUrl: { type: [string, "null"], format: uri }
+
+    PublicPost:
+      type: object
+      required: [id, ownerId, text, title, scheduledAt, createdAt, media, targets]
+      properties:
+        id: { type: string }
+        ownerId: { type: string }
+        text: { type: string }
+        title: { type: [string, "null"] }
+        scheduledAt: { type: [integer, "null"] }
+        createdAt: { type: integer }
+        media:
+          type: array
+          items: { $ref: "#/components/schemas/PostMedia" }
+        targets:
+          type: array
+          items: { $ref: "#/components/schemas/PublicTarget" }
+
+    TargetRequest:
+      type: object
+      required: [accountId]
+      properties:
+        accountId: { type: string }
+        text:
+          type: [string, "null"]
+          description: Caption override for this account.
+        options:
+          type: object
+          description: Option values for this account (keys from the platform's `options`).
+          additionalProperties: true
+
+    PostRequest:
+      type: object
+      required: [text]
+      description: Choose accounts with `targets`, `platforms`, or both (at least one account is required).
+      properties:
+        text:
+          type: string
+          description: The caption. May be empty for media-only posts.
+        title:
+          type: [string, "null"]
+          description: Used by platforms whose `usesTitle` is true (e.g. YouTube).
+        mediaIds:
+          type: array
+          description: Uploaded media, in order.
+          items: { type: string }
+        targets:
+          type: array
+          description: Explicit accounts to post to.
+          items: { $ref: "#/components/schemas/TargetRequest" }
+        platforms:
+          type: array
+          description: "Shortcut: every active connected account on these platforms."
+          items: { $ref: "#/components/schemas/PlatformId" }
+        platformOptions:
+          type: object
+          description: Options per platform, applied to every account of that platform (see `PlatformDescription.options`).
+          propertyNames: { $ref: "#/components/schemas/PlatformId" }
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        platformText:
+          type: object
+          description: Caption override per platform.
+          propertyNames: { $ref: "#/components/schemas/PlatformId" }
+          additionalProperties:
+            type: [string, "null"]
+        scheduledAt:
+          description: ISO date-time or epoch ms. Omit (or null) to publish now.
+          oneOf:
+            - { type: string, format: date-time }
+            - { type: integer }
+            - { type: "null" }
+
+    TargetIssue:
+      type: object
+      required: [accountId, accountName, platform, errors, length]
+      properties:
+        accountId: { type: string }
+        accountName: { type: string }
+        platform: { $ref: "#/components/schemas/PlatformId" }
+        errors:
+          type: array
+          description: Empty when this account can take the post.
+          items: { type: string }
+        length:
+          type: integer
+          description: Caption length as this platform counts it.
+
+    CheckResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        detail:
+          type: string
+          description: What the account can do, when ok.
+        error: { type: string }
+        needsReconnect:
+          type: boolean
+          description: "The login is no longer valid: send the user through connect again."
+
+    PostPage:
+      type: object
+      required: [posts, nextBefore]
+      properties:
+        posts:
+          type: array
+          items: { $ref: "#/components/schemas/PublicPost" }
+        nextBefore:
+          type: [integer, "null"]
+          description: Pass as `before` to get the next page; null when there are no more posts.
+
+    # ---- webhooks (ready-made server) ----
+
+    EventName:
+      type: string
+      enum:
+        - post.created
+        - target.started
+        - target.progress
+        - target.succeeded
+        - target.failed
+        - target.cancelled
+        - account.connected
+        - account.disconnected
+        - account.needsReconnect
+
+    WebhookEnvelope:
+      type: object
+      required: [id, event, data, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Delivery id (same as the `X-Post-Sync-Delivery` header).
+        event: { $ref: "#/components/schemas/EventName" }
+        data:
+          description: The event's payload (as passed to `sync.on(event, ...)`).
+        createdAt:
+          type: integer
+          description: When the event happened (epoch ms).
+
+    PostCreatedEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: post.created }
+            data:
+              type: object
+              required: [post]
+              properties:
+                post: { $ref: "#/components/schemas/PublicPost" }
+
+    TargetStartedEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: target.started }
+            data: { $ref: "#/components/schemas/TargetPayload" }
+
+    TargetProgressEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: target.progress }
+            data:
+              type: object
+              required: [target, message]
+              properties:
+                target: { $ref: "#/components/schemas/PublicTarget" }
+                message: { type: string, examples: ["Uploading 40%"] }
+
+    TargetSucceededEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: target.succeeded }
+            data: { $ref: "#/components/schemas/TargetPayload" }
+
+    TargetFailedEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: target.failed }
+            data:
+              type: object
+              required: [target, error, willRetry, retryAt]
+              properties:
+                target: { $ref: "#/components/schemas/PublicTarget" }
+                error: { type: string }
+                willRetry:
+                  type: boolean
+                  description: True when the error is temporary and the target is queued again.
+                retryAt:
+                  type: [integer, "null"]
+                  description: When the retry runs (epoch ms).
+
+    TargetCancelledEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: target.cancelled }
+            data: { $ref: "#/components/schemas/TargetPayload" }
+
+    AccountConnectedEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: account.connected }
+            data:
+              type: object
+              required: [accounts]
+              properties:
+                accounts:
+                  type: array
+                  items: { $ref: "#/components/schemas/PublicAccount" }
+
+    AccountDisconnectedEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: account.disconnected }
+            data: { $ref: "#/components/schemas/AccountPayload" }
+
+    AccountNeedsReconnectEvent:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEnvelope"
+        - type: object
+          properties:
+            event: { const: account.needsReconnect }
+            data:
+              type: object
+              required: [account, message]
+              properties:
+                account: { $ref: "#/components/schemas/PublicAccount" }
+                message: { type: string }
+
+    TargetPayload:
+      type: object
+      required: [target]
+      properties:
+        target: { $ref: "#/components/schemas/PublicTarget" }
+
+    AccountPayload:
+      type: object
+      required: [account]
+      properties:
+        account: { $ref: "#/components/schemas/PublicAccount" }
+

@@ -2,6 +2,8 @@ import { loadConfig, loadDotEnv } from "./config.js";
 import { buildServer } from "./server.js";
 
 async function main() {
+  // npm runs workspace scripts inside apps/dashboard: resolve .env and DATA_DIR from where npm was started.
+  if (process.env.INIT_CWD) process.chdir(process.env.INIT_CWD);
   loadDotEnv();
   const config = loadConfig();
   const app = await buildServer({ config, logger: { level: process.env.LOG_LEVEL ?? "info" } });

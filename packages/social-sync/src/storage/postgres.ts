@@ -119,11 +119,9 @@ class PostgresStorage implements Storage {
   }
 
   async migrate(): Promise<void> {
-    if (this.t.accounts.includes(".")) {
-      await this.query(`CREATE SCHEMA IF NOT EXISTS ${this.t.accounts.split(".")[0]}`);
-    }
     // Several processes may start at once: CREATE ... IF NOT EXISTS isn't safe against itself without a lock.
     await this.locked("migrate", async (client) => {
+      if (this.t.accounts.includes(".")) await client.query(`CREATE SCHEMA IF NOT EXISTS ${this.t.accounts.split(".")[0]}`);
       for (const statement of schemaSql(this.t, "postgres").split(/;\s*\n/)) {
         if (statement.replace(/--.*$/gm, "").trim()) await client.query(statement);
       }
