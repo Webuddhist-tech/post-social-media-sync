@@ -95,13 +95,13 @@ describe("engine", () => {
     expect((await call("GET", "/accounts", null)).status).toBe(401);
     const connected = await call("POST", "/connect/bluesky/credentials", "alice", { fields: { identifier: "alice.bsky.social", appPassword: "p" } });
     expect(connected.status).toBe(201);
-    const { accounts } = await connected.json();
+    const { accounts } = (await connected.json()) as any;
 
     const form = new FormData();
     form.append("file", new Blob([PNG], { type: "image/png" }), "dot.png");
     const up = await handler.fetch(new Request("https://app.example.com/social/media", { method: "POST", headers: { "x-user": "alice" }, body: form }));
     expect(up.status).toBe(201);
-    const { media } = await up.json();
+    const { media } = (await up.json()) as any;
     expect(media[0].kind).toBe("image");
 
     // The signed media URL is public (platforms download from it).
@@ -111,7 +111,7 @@ describe("engine", () => {
 
     const created = await call("POST", "/posts", "alice", { text: "From HTTP", mediaIds: [media[0].id], targets: [{ accountId: accounts[0].id }] });
     expect(created.status).toBe(201);
-    const { post } = await created.json();
+    const { post } = (await created.json()) as any;
     expect((await call("GET", `/posts/${post.id}`, "bob")).status).toBe(404);
     expect((await call("GET", `/posts/${post.id}`, "alice")).status).toBe(200);
 

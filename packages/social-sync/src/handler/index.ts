@@ -388,6 +388,9 @@ export function createHandler(sync: PostSync, options: HandlerOptions = {}): Pos
       if (err instanceof UserError) return fail((err as any).status ?? 400, err.message, (err as any).issues ? { issues: (err as any).issues } : {});
       if (err instanceof AuthError) return fail(400, err.message);
       if (err instanceof ApiError) return fail(502, err.message);
+      // e.g. an http-errors style error thrown by your authenticate() hook
+      const status = (err as any)?.status ?? (err as any)?.statusCode;
+      if (typeof status === "number" && status >= 400 && status < 500) return fail(status, (err as Error).message);
       sync.logger.error(`${request.method} ${url.pathname} failed`, err);
       return fail(500, "Internal server error");
     }
