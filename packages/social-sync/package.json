@@ -1,0 +1,99 @@
+{
+  "name": "post-social-media-sync",
+  "version": "0.2.0",
+  "description": "Publish one post to Instagram, Facebook, TikTok, YouTube, LinkedIn, Threads, X and Bluesky from your own backend. Multi-user engine with an HTTP API for your frontend, Express/Fastify adapters, SQLite or PostgreSQL storage.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "keywords": [
+    "social media",
+    "scheduler",
+    "instagram",
+    "facebook",
+    "tiktok",
+    "youtube",
+    "linkedin",
+    "threads",
+    "twitter",
+    "x",
+    "bluesky",
+    "crosspost",
+    "express",
+    "fastify"
+  ],
+  "exports": {
+    ".": {
+      "post-sync-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./sqlite": {
+      "post-sync-source": "./src/storage/sqlite.ts",
+      "types": "./dist/storage/sqlite.d.ts",
+      "default": "./dist/storage/sqlite.js"
+    },
+    "./postgres": {
+      "post-sync-source": "./src/storage/postgres.ts",
+      "types": "./dist/storage/postgres.d.ts",
+      "default": "./dist/storage/postgres.js"
+    },
+    "./express": {
+      "post-sync-source": "./src/adapters/express.ts",
+      "types": "./dist/adapters/express.d.ts",
+      "default": "./dist/adapters/express.js"
+    },
+    "./fastify": {
+      "post-sync-source": "./src/adapters/fastify.ts",
+      "types": "./dist/adapters/fastify.d.ts",
+      "default": "./dist/adapters/fastify.js"
+    },
+    "./client": {
+      "post-sync-source": "./src/client/index.ts",
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "twitter-text": "^3.1.0"
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=11",
+    "pg": ">=8",
+    "fastify": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/busboy": "^1.5.4",
+    "@types/express": "^5.0.3",
+    "@types/pg": "^8.15.6",
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1",
+    "fastify": "^5.12.5",
+    "pg": "^8.23.1"
+  }
+}

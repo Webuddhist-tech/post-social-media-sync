@@ -1,0 +1,24 @@
+{
+  "name": "@post-sync/dashboard",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Ready-to-run Post Sync server: a web dashboard (or headless HTTP API) built on the post-social-media-sync package.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "tsx watch --conditions=post-sync-source src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/static": "^10.1.5",
+    "better-sqlite3": "^13.0.3",
+    "fastify": "^5.12.5",
+    "pg": "^8.23.1",
+    "post-social-media-sync": "*"
+  }
+}
